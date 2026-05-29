@@ -259,23 +259,10 @@ final class AuthenticationOperation: ResultOperation<(ALTTeam, ALTCertificate, A
                     team.isActiveTeam = false
                 }
 
-                let activeAppsMinimumVersion = OperatingSystemVersion(majorVersion: 13, minorVersion: 3, patchVersion: 1)
-
-                let isMinimumVersionMatching = ProcessInfo.processInfo.isOperatingSystemAtLeast(activeAppsMinimumVersion)
-                let isSparseRestorePatched   = ProcessInfo().sparseRestorePatched
-                let isAppLimitDisabled       = UserDefaults.standard.isAppLimitDisabled
-
+                // Do not infer SideStore's local active-app limit from team.type.
+                // Previous/expired paid developer accounts can be reported as free while still using long-lived profiles.
                 UserDefaults.standard.activeAppsLimit = nil
-                // TODO: @mahee96: is the minimum ver match for ios 13.3.1 check required?
-                //                 if so what is the app limit? As nil app limit specifies unlimited apps?!
-                if team.type == .free//, isMinimumVersionMatching 
-                {
-                    if (!isAppLimitDisabled && isSparseRestorePatched) ||
-                        (isAppLimitDisabled && !isSparseRestorePatched)
-                    {
-                         UserDefaults.standard.activeAppsLimit = InstalledApp.freeAccountActiveAppsLimit
-                    }
-                }
+                Logger.sideload.notice("Local active app limit disabled for selected Apple team \(team.identifier, privacy: .public).")
                 
                 // Save
                 try context.save()
@@ -517,24 +504,34 @@ private extension AuthenticationOperation
     
     func fetchTeam(for account: ALTAccount, session: ALTAppleAPISession, completionHandler: @escaping (Result<ALTTeam, Swift.Error>) -> Void)
     {
+        func finish(_ result: Result<ALTTeam, Swift.Error>)
+        {
+            if case .success(let team) = result
+            {
+                Logger.sideload.notice("Selected Apple team: id=\(team.identifier, privacy: .public), name=\(team.name, privacy: .public), type=\(String(describing: team.type), privacy: .public)")
+            }
+            
+            completionHandler(result)
+        }
+        
         func selectTeam(from teams: [ALTTeam])
          {
              if teams.count <= 1 {
                  if let team = teams.first {
-                     return completionHandler(.success(team))
+                     return finish(.success(team))
                  } else {
-                     return completionHandler(.failure(AuthenticationError(.noTeam)))
+                     return finish(.failure(AuthenticationError(.noTeam)))
                  }
              } else {
                  DispatchQueue.main.async {
                      let selectTeamViewController = self.storyboard.instantiateViewController(withIdentifier: "selectTeamViewController") as! SelectTeamViewController
 
                      selectTeamViewController.teams = teams
-                     selectTeamViewController.completionHandler = completionHandler
+                     selectTeamViewController.completionHandler = finish
 
                      if !self.present(selectTeamViewController)
                      {
-                         return completionHandler(.failure(AuthenticationError(.noTeam)))
+                         return finish(.failure(AuthenticationError(.noTeam)))
                      }
                  }
              }
@@ -545,10 +542,15 @@ private extension AuthenticationOperation
             {
             case .failure(let error): completionHandler(.failure(error))
             case .success(let teams):
+                for team in teams
+                {
+                    Logger.sideload.notice("Apple team candidate: id=\(team.identifier, privacy: .public), name=\(team.name, privacy: .public), type=\(String(describing: team.type), privacy: .public)")
+                }
+                
                 DatabaseManager.shared.persistentContainer.performBackgroundTask { (context) in
                     if let activeTeam = DatabaseManager.shared.activeTeam(in: context), let altTeam = teams.first(where: { $0.identifier == activeTeam.identifier })
                     {
-                        completionHandler(.success(altTeam))
+                        finish(.success(altTeam))
                     }
                     else
                     {

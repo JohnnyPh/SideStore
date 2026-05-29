@@ -699,12 +699,8 @@ private extension SettingsViewController
             // accept state change only when valid
             UserDefaults.standard.isAppLimitDisabled = sender.isOn
             
-            // TODO: Here we force reload the activeAppsLimit after detecting change in isAppLimitDisabled
-            //       Why do we need to do this, once identified if this is intentional and working as expected, remove this todo
-            if UserDefaults.standard.activeAppsLimit != nil
-            {
-                UserDefaults.standard.activeAppsLimit = InstalledApp.freeAccountActiveAppsLimit
-            }
+            // Keep the local app limit disabled for previous/expired paid developer accounts.
+            UserDefaults.standard.activeAppsLimit = nil
         }
     }
     

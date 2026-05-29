@@ -11,6 +11,15 @@ import AltStoreCore
 import AltSign
 import Roxas
 
+private let longLivedProvisioningProfileDuration = TimeInterval(300 * 24 * 60 * 60)
+
+private extension ALTProvisioningProfile
+{
+    var hasLongLivedExpiration: Bool {
+        return self.expirationDate.timeIntervalSince(self.creationDate) >= longLivedProvisioningProfileDuration
+    }
+}
+
 @objc(FetchProvisioningProfilesOperation)
 class FetchProvisioningProfilesOperation: ResultOperation<[String: ALTProvisioningProfile]>
 {
@@ -124,6 +133,12 @@ class FetchProvisioningProfilesOperation: ResultOperation<[String: ALTProvisioni
     
     internal func fetchProvisioningProfile(for appID: ALTAppID, app: ALTApplication, team: ALTTeam, session: ALTAppleAPISession, completionHandler: @escaping (Result<ALTProvisioningProfile, Error>) -> Void)
     {
+        func finish(with profile: ALTProvisioningProfile)
+        {
+            self.updateActiveAppLimitDetection(with: profile, appID: appID, team: team)
+            completionHandler(.success(profile))
+        }
+        
         ALTAppleAPI.shared.fetchProvisioningProfile(for: appID, deviceType: .iphone, team: team, session: session) { (profile, error) in
             switch Result(profile, error)
             {
@@ -137,14 +152,18 @@ class FetchProvisioningProfilesOperation: ResultOperation<[String: ALTProvisioni
                     case .failure:
                         // As of March 20, 2023, the free provisioning profile is re-generated each fetch, and you can no longer delete it.
                         // So instead, we just return the fetched profile from above.
-                        completionHandler(.success(profile))
+                        finish(with: profile)
                         
                     case .success:
                         Logger.sideload.notice("Generating new free provisioning profile for App ID \(appID.bundleIdentifier, privacy: .public).")
                         
                         // Fetch new provisioning profile
                         ALTAppleAPI.shared.fetchProvisioningProfile(for: appID, deviceType: .iphone, team: team, session: session) { (profile, error) in
-                            completionHandler(Result(profile, error))
+                            switch Result(profile, error)
+                            {
+                            case .failure(let error): completionHandler(.failure(error))
+                            case .success(let profile): finish(with: profile)
+                            }
                         }
                     }
                 }
@@ -155,10 +174,23 @@ class FetchProvisioningProfilesOperation: ResultOperation<[String: ALTProvisioni
 
 extension FetchProvisioningProfilesOperation
 {
+    private func updateActiveAppLimitDetection(with profile: ALTProvisioningProfile, appID: ALTAppID, team: ALTTeam)
+    {
+        let isFreeProfile = profile.isFreeProvisioningProfile == true
+        let lifetimeDays = Int(profile.expirationDate.timeIntervalSince(profile.creationDate) / (24 * 60 * 60))
+        Logger.sideload.notice("Fetched provisioning profile for App ID \(appID.bundleIdentifier, privacy: .public). Team: \(team.identifier, privacy: .public), free profile: \(String(describing: isFreeProfile), privacy: .public), lifetime days: \(lifetimeDays, privacy: .public).")
+        
+        if profile.hasLongLivedExpiration || !isFreeProfile
+        {
+            UserDefaults.standard.activeAppsLimit = nil
+            Logger.sideload.notice("Detected long-lived or non-free provisioning profile behavior for team \(team.identifier, privacy: .public); local active app limit remains disabled.")
+        }
+    }
+    
     private func prepareProvisioningProfile(for app: ALTApplication,
                                     parentApp: ALTApplication?,
                                     team: ALTTeam,
-                                    session: ALTAppleAPISession, c
+                                    session: ALTAppleAPISession,
                                     completionHandler: @escaping (Result<ALTProvisioningProfile, Error>) -> Void)
     {
         DatabaseManager.shared.persistentContainer.performBackgroundTask { (context) in
@@ -298,19 +330,9 @@ extension FetchProvisioningProfilesOperation
                     
                     let sortedExpirationDates = appIDs.compactMap { $0.expirationDate }.sorted(by: { $0 < $1 })
                     
-                    if team.type == .free
+                    if team.type == .free && requiredAppIDs > availableAppIDs
                     {
-                        if requiredAppIDs > availableAppIDs
-                        {
-                            if let expirationDate = sortedExpirationDates.first
-                            {
-                                throw OperationError.maximumAppIDLimitReached(appName: application.name, requiredAppIDs: requiredAppIDs, availableAppIDs: availableAppIDs, expirationDate: expirationDate)
-                            }
-                            else
-                            {
-                                throw ALTAppleAPIError(.maximumAppIDLimitReached)
-                            }
-                        }
+                        Logger.sideload.notice("Skipping local free-account App ID limit preflight for \(bundleIdentifier, privacy: .public). Existing App IDs: \(appIDs.count, privacy: .public), required: \(requiredAppIDs, privacy: .public), heuristic available: \(availableAppIDs, privacy: .public).")
                     }
                     //App ID name must be ascii. If the name is not ascii, using bundleID instead
                     let appIDName: String
@@ -353,9 +375,11 @@ extension FetchProvisioningProfilesOperation
                                 guard let res = res else {return completionHandler(.failure(ALTError(.unknown)))}
                                 for appid in res {
                                     if appid.bundleIdentifier == bundleIdentifier {
-                                        completionHandler(.success(appid))
+                                        return completionHandler(.success(appid))
                                     }
                                 }
+                                
+                                completionHandler(.failure(ALTAppleAPIError.bundleIdentifierUnavailable))
                             }
                         }
                         catch
