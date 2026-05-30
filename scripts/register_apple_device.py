@@ -247,11 +247,26 @@ def plist_dumps(value: Any) -> bytes:
     return plistlib.dumps(value, fmt=plistlib.FMT_XML, sort_keys=False)
 
 
+PLIST_XML_WRAPPER_PREFIX = (
+    b'<?xml version="1.0" encoding="UTF-8"?>\n'
+    b'<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+    b'"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+    b'<plist version="1.0">\n'
+)
+PLIST_XML_WRAPPER_SUFFIX = b"\n</plist>\n"
+
+
 def plist_loads(data: bytes) -> Any:
     try:
         return plistlib.loads(data)
-    except Exception as exc:
-        raise FlowError("Response was not a valid plist.") from exc
+    except Exception as original_exc:
+        stripped = data.strip(b"\x00\t\r\n ")
+        if stripped.startswith((b"<dict>", b"<array>")):
+            try:
+                return plistlib.loads(PLIST_XML_WRAPPER_PREFIX + stripped + PLIST_XML_WRAPPER_SUFFIX)
+            except Exception:
+                pass
+        raise FlowError("Response was not a valid plist.") from original_exc
 
 
 def parse_plist_response(response: requests.Response, context: str) -> Any:
