@@ -379,7 +379,7 @@ extension FetchProvisioningProfilesOperation
                                     }
                                 }
                                 
-                                completionHandler(.failure(ALTAppleAPIError.bundleIdentifierUnavailable))
+                                completionHandler(.failure(ALTAppleAPIError(.bundleIdentifierUnavailable)))
                             }
                         }
                         catch
