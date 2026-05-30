@@ -87,6 +87,7 @@ extension SettingsViewController
         case exportAccount
         case importCert
         case exportCert
+        case exportSigningAssets
     }
 
     private enum BetaTestingRow: Int, CaseIterable {
@@ -376,7 +377,72 @@ final class SettingsViewController: UITableViewController
             self.present(exportVC, animated: true)
         }
     }
-    
+
+    func exportSigningAssets()
+    {
+        guard let certData = Keychain.shared.signingCertificate else {
+            let toastView = ToastView(text: NSLocalizedString("Failed to export signing files!", comment: ""), detailText: "Certificate not found.")
+            toastView.show(in: self)
+            return
+        }
+
+        let certificate = ALTCertificate(p12Data: certData, password: nil) ??
+            Keychain.shared.signingCertificatePassword.flatMap {
+                ALTCertificate(p12Data: certData, password: $0)
+            }
+
+        guard let p12Data = certificate?.encryptedP12Data(withPassword: "") else {
+            let toastView = ToastView(text: NSLocalizedString("Failed to export signing files!", comment: ""), detailText: "Failed to read signing certificate.")
+            toastView.show(in: self)
+            return
+        }
+
+        let provisioningProfileURL = Bundle.main.provisioningProfileURL
+        guard FileManager.default.fileExists(atPath: provisioningProfileURL.path) else {
+            let toastView = ToastView(text: NSLocalizedString("Failed to export signing files!", comment: ""), detailText: "Provisioning profile not found.")
+            toastView.show(in: self)
+            return
+        }
+
+        do
+        {
+            let fileManager = FileManager.default
+            let exportDirectoryURL = fileManager.temporaryDirectory.appendingPathComponent("SideStoreSigningFiles", isDirectory: true)
+            if fileManager.fileExists(atPath: exportDirectoryURL.path)
+            {
+                try fileManager.removeItem(at: exportDirectoryURL)
+            }
+
+            try fileManager.createDirectory(at: exportDirectoryURL, withIntermediateDirectories: true)
+
+            let p12URL = exportDirectoryURL.appendingPathComponent("SideStoreSigningCertificate.p12")
+            let exportedProvisioningProfileURL = exportDirectoryURL.appendingPathComponent("SideStore.mobileprovision")
+            let passwordInfoURL = exportDirectoryURL.appendingPathComponent("README.txt")
+
+            try p12Data.write(to: p12URL, options: .atomic)
+            try fileManager.copyItem(at: provisioningProfileURL, to: exportedProvisioningProfileURL)
+
+            let passwordInfo = """
+            SideStore signing export
+
+            SideStoreSigningCertificate.p12 password: leave blank
+            SideStore.mobileprovision password: none
+            """
+            try passwordInfo.write(to: passwordInfoURL, atomically: true, encoding: .utf8)
+
+            let exportViewController = UIDocumentPickerViewController(
+                forExporting: [p12URL, exportedProvisioningProfileURL, passwordInfoURL],
+                asCopy: true
+            )
+            self.present(exportViewController, animated: true)
+        }
+        catch
+        {
+            let toastView = ToastView(text: NSLocalizedString("Failed to export signing files!", comment: ""), detailText: error.localizedDescription)
+            toastView.show(in: self)
+        }
+    }
+
     override func viewWillAppear(_ animated: Bool)
     {
         super.viewWillAppear(animated)
@@ -1530,6 +1596,8 @@ extension SettingsViewController
                     let exportVC = UIDocumentPickerViewController(forExporting: [newCertTmpPath], asCopy: false)
                     self.present(exportVC, animated: true)
                 }
+            case .exportSigningAssets:
+                self.exportSigningAssets()
             }
         
         case .diagnostics:
