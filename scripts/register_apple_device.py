@@ -21,6 +21,7 @@ import os
 import plistlib
 import re
 import secrets
+import ssl
 import sys
 import time
 import uuid
@@ -31,6 +32,7 @@ from typing import Any, Callable
 
 try:
     import requests
+    import truststore
     import websocket
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -45,6 +47,7 @@ except ImportError as exc:
         )
         raise SystemExit(2)
     requests = None
+    truststore = None
     websocket = None
     Cipher = None
     algorithms = None
@@ -344,6 +347,102 @@ def is_relative_to(child: Path, parent: Path) -> bool:
         return False
 
 
+def default_cache_dir() -> Path:
+    return Path(os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA", str(Path.home()))) / "SideStoreDeviceRegister"
+
+
+def harden_user_cache_file(path: Path, label: str) -> None:
+    if os.name == "nt":
+        appdata = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+        try:
+            if appdata and is_relative_to(path, Path(appdata)):
+                return
+        except OSError:
+            pass
+        print(
+            f"WARNING: {label} is outside the per-user app data directory; "
+            "Windows ACL hardening is not applied by this script.",
+            file=sys.stderr,
+        )
+        return
+
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def write_json_atomically(path: Path, payload: dict[str, Any], label: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(payload, indent=2, sort_keys=True)
+    try:
+        import tempfile
+
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f"{path.name}.",
+            suffix=".tmp",
+            dir=str(path.parent),
+            text=True,
+        )
+        temporary_path = Path(temporary_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as file:
+                file.write(text)
+            os.replace(temporary_path, path)
+            harden_user_cache_file(path, label)
+        finally:
+            if temporary_path.exists():
+                try:
+                    temporary_path.unlink()
+                except OSError:
+                    pass
+    except OSError as exc:
+        raise FlowError(f"Could not save {label}: {exc}") from exc
+
+
+TLSVerify = str | bool | None
+
+
+def configure_tls(tls_store: str, ca_bundle: str | None, allow_insecure_tls: bool, debug: DebugPrinter) -> TLSVerify:
+    if allow_insecure_tls:
+        requests.packages.urllib3.disable_warnings()
+        print(
+            "WARNING: TLS certificate verification is disabled. "
+            "Use this only for temporary local debugging on a trusted network.",
+            file=sys.stderr,
+        )
+        debug("TLS certificate verification", "disabled")
+        return False
+
+    if ca_bundle:
+        path = Path(ca_bundle).expanduser()
+        if not path.is_file():
+            raise FlowError(f"CA bundle does not exist: {path}")
+        os.environ["REQUESTS_CA_BUNDLE"] = str(path)
+        debug("TLS CA bundle", str(path))
+        return str(path)
+
+    use_system_store = tls_store == "system" or (tls_store == "auto" and os.name == "nt")
+    if use_system_store:
+        truststore.inject_into_ssl()
+        debug("TLS certificate store", "system")
+    else:
+        debug("TLS certificate store", "certifi")
+    return None
+
+
+def format_request_exception(exc: requests.RequestException) -> str:
+    message = str(exc)
+    if "CERTIFICATE_VERIFY_FAILED" not in message and "trust provider" not in message:
+        return message
+    return (
+        f"{message}\n"
+        "TLS certificate verification failed. If this machine uses antivirus/proxy HTTPS inspection, "
+        "install its root certificate into Windows Trusted Root Certification Authorities, pass "
+        "--ca-bundle PATH_TO_ROOT_CA.pem, or temporarily retry with --allow-insecure-tls."
+    )
+
+
 def sha256(data: bytes) -> bytes:
     return hashlib.sha256(data).digest()
 
@@ -557,11 +656,14 @@ class AnisetteData:
 
 
 class AnisetteClient:
-    def __init__(self, base_url: str, cache_path: Path, debug: DebugPrinter) -> None:
+    def __init__(self, base_url: str, cache_path: Path, debug: DebugPrinter, verify: TLSVerify = None) -> None:
         self.base_url = base_url.rstrip("/")
         self.cache_path = cache_path
         self.debug = debug
+        self.verify = verify
         self.http = requests.Session()
+        if verify is not None:
+            self.http.verify = verify
         self.client_info: str | None = None
         self.user_agent: str | None = None
         self.identifier: str | None = None
@@ -629,24 +731,7 @@ class AnisetteClient:
         self.debug("Saved anisette cache", str(self.cache_path))
 
     def _harden_cache_file(self) -> None:
-        if os.name == "nt":
-            appdata = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
-            try:
-                if appdata and is_relative_to(self.cache_path, Path(appdata)):
-                    return
-            except OSError:
-                pass
-            print(
-                "WARNING: anisette cache is outside the per-user local app data directory; "
-                "Windows ACL hardening is not applied by this script.",
-                file=sys.stderr,
-            )
-            return
-
-        try:
-            os.chmod(self.cache_path, 0o600)
-        except OSError:
-            pass
+        harden_user_cache_file(self.cache_path, "anisette cache")
 
     def _fetch_client_info(self) -> None:
         url = f"{self.base_url}/v3/client_info"
@@ -654,7 +739,7 @@ class AnisetteClient:
         try:
             response = self.http.get(url, timeout=30)
         except requests.RequestException as exc:
-            raise FlowError(f"Could not reach anisette v3 server {self.base_url}: {exc}") from exc
+            raise FlowError(f"Could not reach anisette v3 server {self.base_url}: {format_request_exception(exc)}") from exc
         self.debug("client_info status", response.status_code)
         try:
             payload = response.json()
@@ -717,7 +802,7 @@ class AnisetteClient:
                 timeout=30,
             )
         except requests.RequestException as exc:
-            raise FlowError(f"Could not request Apple provisioning URLs: {exc}") from exc
+            raise FlowError(f"Could not request Apple provisioning URLs: {format_request_exception(exc)}") from exc
         self.debug("GSA lookup status", lookup.status_code)
         self.debug("GSA lookup body", lookup.text[:2000], secret=True)
         lookup_plist = parse_plist_response(lookup, "Apple provisioning lookup")
@@ -733,7 +818,15 @@ class AnisetteClient:
         self.debug("Opening anisette provisioning websocket", ws_url)
 
         try:
-            ws = websocket.create_connection(ws_url, timeout=30)
+            ssl_options = None
+            if ws_url.startswith("wss://") and self.verify is False:
+                ssl_options = {"cert_reqs": ssl.CERT_NONE, "check_hostname": False}
+            elif ws_url.startswith("wss://") and isinstance(self.verify, str):
+                ssl_options = {"ca_certs": self.verify}
+            if ssl_options:
+                ws = websocket.create_connection(ws_url, timeout=30, sslopt=ssl_options)
+            else:
+                ws = websocket.create_connection(ws_url, timeout=30)
         except Exception as exc:
             raise FlowError(f"Could not open anisette provisioning websocket: {exc}") from exc
         try:
@@ -788,7 +881,7 @@ class AnisetteClient:
         try:
             response = self.http.post(url, headers=self._apple_provisioning_headers(), data=body, timeout=30)
         except requests.RequestException as exc:
-            raise FlowError(f"Could not start Apple anisette provisioning: {exc}") from exc
+            raise FlowError(f"Could not start Apple anisette provisioning: {format_request_exception(exc)}") from exc
         self.debug("Start provisioning status", response.status_code)
         payload = parse_plist_response(response, "Apple start provisioning")
         if not response.ok:
@@ -802,7 +895,7 @@ class AnisetteClient:
         try:
             response = self.http.post(url, headers=self._apple_provisioning_headers(), data=body, timeout=30)
         except requests.RequestException as exc:
-            raise FlowError(f"Could not finish Apple anisette provisioning: {exc}") from exc
+            raise FlowError(f"Could not finish Apple anisette provisioning: {format_request_exception(exc)}") from exc
         self.debug("End provisioning status", response.status_code)
         payload = parse_plist_response(response, "Apple end provisioning")
         if not response.ok:
@@ -828,7 +921,7 @@ class AnisetteClient:
                 timeout=30,
             )
         except requests.RequestException as exc:
-            raise FlowError(f"Could not fetch anisette headers: {exc}") from exc
+            raise FlowError(f"Could not fetch anisette headers: {format_request_exception(exc)}") from exc
         self.debug("get_headers status", response.status_code)
         try:
             payload = response.json()
@@ -873,11 +966,92 @@ class AppleSession:
     anisette: AnisetteData
 
 
+class SessionStore:
+    def __init__(self, path: Path, debug: DebugPrinter) -> None:
+        self.path = path
+        self.debug = debug
+
+    def _key(self, apple_id: str) -> str:
+        return hashlib.sha256(apple_id.strip().lower().encode("utf-8")).hexdigest()
+
+    def _read(self) -> dict[str, Any]:
+        if not self.path.exists():
+            return {"version": 1, "sessions": {}}
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            self.debug("Ignoring invalid Apple session cache", str(exc))
+            return {"version": 1, "sessions": {}}
+        if not isinstance(payload, dict):
+            return {"version": 1, "sessions": {}}
+        sessions = payload.get("sessions")
+        if not isinstance(sessions, dict):
+            payload["sessions"] = {}
+        return payload
+
+    def _write(self, payload: dict[str, Any]) -> None:
+        write_json_atomically(self.path, payload, "Apple session cache")
+        self.debug("Saved Apple session cache", str(self.path))
+
+    def load(self, apple_id: str, anisette: AnisetteData) -> AppleSession | None:
+        payload = self._read()
+        sessions = payload.get("sessions", {})
+        if not isinstance(sessions, dict):
+            return None
+        entry = sessions.get(self._key(apple_id))
+        if not isinstance(entry, dict):
+            return None
+        dsid = entry.get("dsid")
+        auth_token = entry.get("auth_token")
+        if not isinstance(dsid, str) or not isinstance(auth_token, str) or not dsid or not auth_token:
+            self.delete(apple_id)
+            return None
+        self.debug(
+            "Loaded cached Apple session",
+            {
+                "path": str(self.path),
+                "created_at": entry.get("created_at"),
+                "last_used_at": entry.get("last_used_at"),
+                "auth_token": auth_token,
+            },
+            secret=True,
+        )
+        return AppleSession(dsid=dsid, auth_token=auth_token, anisette=anisette)
+
+    def save(self, apple_id: str, session: AppleSession) -> None:
+        payload = self._read()
+        sessions = payload.setdefault("sessions", {})
+        if not isinstance(sessions, dict):
+            sessions = {}
+            payload["sessions"] = sessions
+        key = self._key(apple_id)
+        existing = sessions.get(key) if isinstance(sessions.get(key), dict) else {}
+        created_at = existing.get("created_at") if isinstance(existing, dict) else None
+        now = now_iso_z()
+        sessions[key] = {
+            "created_at": created_at or now,
+            "last_used_at": now,
+            "dsid": session.dsid,
+            "auth_token": session.auth_token,
+        }
+        self._write(payload)
+
+    def delete(self, apple_id: str) -> None:
+        payload = self._read()
+        sessions = payload.get("sessions", {})
+        if not isinstance(sessions, dict):
+            return
+        if sessions.pop(self._key(apple_id), None) is not None:
+            self._write(payload)
+
+
 class AppleDeveloperClient:
-    def __init__(self, anisette: AnisetteData, debug: DebugPrinter) -> None:
+    def __init__(self, anisette: AnisetteData, debug: DebugPrinter, verify: TLSVerify = None) -> None:
         self.anisette = anisette
         self.debug = debug
         self.http = requests.Session()
+        if verify is not None:
+            self.http.verify = verify
         self.refresh_anisette: Callable[[], AnisetteData] | None = None
         self.anisette_fetched_at = time.monotonic()
 
@@ -1008,7 +1182,7 @@ class AppleDeveloperClient:
         try:
             response = self.http.post(GSA_SERVICE_URL, headers=headers, data=body, timeout=30)
         except requests.RequestException as exc:
-            raise FlowError(f"Apple authentication request failed: {exc}") from exc
+            raise FlowError(f"Apple authentication request failed: {format_request_exception(exc)}") from exc
         self.debug("GSA auth HTTP status", response.status_code)
         self.debug("GSA auth raw response", response.content[:2000], secret=True)
         payload = parse_plist_response(response, "Apple authentication")
@@ -1041,7 +1215,7 @@ class AppleDeveloperClient:
         try:
             request_response = self.http.get("https://gsa.apple.com/auth/verify/trusteddevice", headers=headers, timeout=30)
         except requests.RequestException as exc:
-            raise FlowError(f"Could not request trusted-device 2FA code: {exc}") from exc
+            raise FlowError(f"Could not request trusted-device 2FA code: {format_request_exception(exc)}") from exc
         self.debug("Trusted-device request status", request_response.status_code)
         if not request_response.ok:
             raise_http_error(request_response, "Trusted-device 2FA request")
@@ -1056,7 +1230,7 @@ class AppleDeveloperClient:
                 timeout=30,
             )
         except requests.RequestException as exc:
-            raise FlowError(f"Could not verify trusted-device 2FA code: {exc}") from exc
+            raise FlowError(f"Could not verify trusted-device 2FA code: {format_request_exception(exc)}") from exc
         self.debug("Trusted-device verify status", verify_response.status_code)
         payload = parse_plist_response(verify_response, "Trusted-device verification")
         if not verify_response.ok:
@@ -1083,7 +1257,7 @@ class AppleDeveloperClient:
                 timeout=30,
             )
         except requests.RequestException as exc:
-            raise FlowError(f"Could not request SMS verification code: {exc}") from exc
+            raise FlowError(f"Could not request SMS verification code: {format_request_exception(exc)}") from exc
         self.debug("SMS request status", request_response.status_code)
         if not request_response.ok:
             raise_http_error(request_response, "SMS verification request")
@@ -1103,7 +1277,7 @@ class AppleDeveloperClient:
                 timeout=30,
             )
         except requests.RequestException as exc:
-            raise FlowError(f"Could not verify SMS code: {exc}") from exc
+            raise FlowError(f"Could not verify SMS code: {format_request_exception(exc)}") from exc
         self.debug("SMS verify status", verify_response.status_code)
         self.debug("SMS verify headers", dict(verify_response.headers), secret=True)
         if verify_response.status_code != 200 or "X-Apple-PE-Token" not in verify_response.headers:
@@ -1187,7 +1361,7 @@ class AppleDeveloperClient:
         try:
             response = self.http.post(url, headers=headers, data=body, timeout=30)
         except requests.RequestException as exc:
-            raise FlowError(f"Apple developer service request failed for {action}: {exc}") from exc
+            raise FlowError(f"Apple developer service request failed for {action}: {format_request_exception(exc)}") from exc
         self.debug("Developer response status", response.status_code)
         self.debug("Developer raw response", response.content[:4000], secret=True)
         payload = parse_plist_response(response, f"Apple developer service {action}")
@@ -1406,7 +1580,7 @@ def validate_team(team: dict[str, Any]) -> None:
         raise FlowError("Apple returned a malformed team without a teamId.")
 
 
-def prompt_missing(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+def prompt_missing(args: argparse.Namespace, parser: argparse.ArgumentParser, *, need_password: bool) -> None:
     def require_interactive(label: str) -> None:
         if not sys.stdin.isatty():
             parser.error(f"{label} is required in non-interactive mode.")
@@ -1438,6 +1612,17 @@ def prompt_missing(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
         require_interactive("--apple-id")
         args.apple_id = input("Apple ID email: ").strip()
 
+    if not need_password:
+        return
+
+    resolve_password(args, parser)
+
+
+def resolve_password(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    def require_interactive(label: str) -> None:
+        if not sys.stdin.isatty():
+            parser.error(f"{label} is required in non-interactive mode.")
+
     if args.password_env:
         args.password = os.environ.get(args.password_env)
         if not args.password:
@@ -1466,11 +1651,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--anisette-url", default=DEFAULT_ANISETTE_URL, help="SideStore anisette server URL.")
     parser.add_argument("--allow-insecure-anisette-http", action="store_true", help="Allow http:// anisette URLs for local testing only.")
     parser.add_argument(
+        "--tls-trust-store",
+        choices=["auto", "system", "certifi"],
+        default="auto",
+        help="TLS certificate trust source. auto uses the Windows/system store on Windows.",
+    )
+    parser.add_argument("--ca-bundle", help="Custom CA bundle PEM file for Apple and anisette HTTPS requests.")
+    parser.add_argument(
+        "--allow-insecure-tls",
+        action="store_true",
+        help="Disable HTTPS certificate verification. Temporary debugging only.",
+    )
+    parser.add_argument(
         "--cache",
-        default=str(Path(os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA", str(Path.home()))) / "SideStoreDeviceRegister" / "anisette.json"),
+        default=str(default_cache_dir() / "anisette.json"),
         help="Path for local anisette provisioning cache.",
     )
     parser.add_argument("--reset-anisette-cache", action="store_true", help="Delete and recreate anisette cache.")
+    parser.add_argument(
+        "--session-cache",
+        default=str(default_cache_dir() / "apple_sessions.json"),
+        help="Path for cached Apple developer login tokens.",
+    )
+    parser.add_argument("--reset-session-cache", action="store_true", help="Delete the cached Apple session for this Apple ID before running.")
+    parser.add_argument("--no-session-cache", action="store_true", help="Do not read or save cached Apple developer login tokens.")
     parser.set_defaults(debug=True)
     parser.add_argument("--debug", dest="debug", action="store_true", help="Print verbose debug logs. Enabled by default; secrets are redacted.")
     parser.add_argument("--quiet", dest="debug", action="store_false", help="Disable debug logs.")
@@ -1493,7 +1697,7 @@ def main() -> int:
         print("Python 3.10 or newer is required.", file=sys.stderr)
         return 2
 
-    if requests is None or websocket is None or Cipher is None or algorithms is None or modes is None or AESGCM is None or PKCS7 is None:
+    if requests is None or truststore is None or websocket is None or Cipher is None or algorithms is None or modes is None or AESGCM is None or PKCS7 is None:
         print(
             "Missing runtime dependencies.\n"
             "Install with:\n"
@@ -1505,15 +1709,22 @@ def main() -> int:
     args = parser.parse_args()
     if args.password_env and args.password_stdin:
         parser.error("Use only one of --password-env or --password-stdin.")
+    if args.allow_insecure_tls and args.ca_bundle:
+        parser.error("Use only one of --allow-insecure-tls or --ca-bundle.")
     two_factor_sources = sum(bool(value) for value in (args.two_factor_code, args.two_factor_env, args.two_factor_stdin))
     if two_factor_sources > 1:
         parser.error("Use only one of --2fa-code, --2fa-env, or --2fa-stdin.")
-    prompt_missing(args, parser)
+
+    prompt_missing(args, parser, need_password=False)
     validate_https_url(args.anisette_url, allow_http=args.allow_insecure_anisette_http)
 
     debug = DebugPrinter(enabled=args.debug, unsafe_secrets=args.unsafe_debug_secrets)
+    verify = configure_tls(args.tls_trust_store, args.ca_bundle, args.allow_insecure_tls, debug)
     udid = normalize_udid(args.udid)
     cache_path = Path(args.cache)
+    session_store = None if args.no_session_cache else SessionStore(Path(args.session_cache), debug)
+    if args.reset_session_cache and session_store is not None:
+        session_store.delete(args.apple_id)
 
     verification_prompt = VerificationCodeProvider(
         args.two_factor_code,
@@ -1525,16 +1736,42 @@ def main() -> int:
     debug("Target UDID", udid)
     debug("Anisette URL", args.anisette_url)
     debug("Anisette cache path", str(cache_path))
+    if session_store is not None:
+        debug("Apple session cache path", str(session_store.path))
 
-    anisette_client = AnisetteClient(args.anisette_url, cache_path, debug)
+    anisette_client = AnisetteClient(args.anisette_url, cache_path, debug, verify=verify)
     anisette = anisette_client.load_or_create(reset=args.reset_anisette_cache)
     debug("Resolved anisette data", anisette.__dict__, secret=True)
 
-    client = AppleDeveloperClient(anisette, debug)
+    client = AppleDeveloperClient(anisette, debug, verify=verify)
     client.set_anisette_refresh(lambda: anisette_client.load_or_create(reset=False))
-    account, session = client.authenticate(args.apple_id, args.password, verification_prompt)
+
+    account: dict[str, Any] | None = None
+    session: AppleSession | None = None
+    used_cached_session = False
+    if session_store is not None:
+        cached_session = session_store.load(args.apple_id, client.anisette)
+        if cached_session is not None:
+            debug("Trying cached Apple developer session")
+            try:
+                account = client.fetch_account(cached_session)
+                session = cached_session
+                session_store.save(args.apple_id, session)
+                used_cached_session = True
+            except FlowError as exc:
+                debug("Cached Apple developer session failed; full authentication required", str(exc))
+                session_store.delete(args.apple_id)
+
+    if account is None or session is None:
+        resolve_password(args, parser)
+        account, session = client.authenticate(args.apple_id, args.password, verification_prompt)
+        if session_store is not None:
+            session_store.save(args.apple_id, session)
+
     print()
     print(f"Authenticated as: {account.get('email', args.apple_id)}")
+    if used_cached_session:
+        print("Used cached Apple session; password and 2FA were not required.")
 
     teams = client.fetch_teams(account, session)
     team = choose_team(teams, args.team_id)
