@@ -84,6 +84,10 @@ class FlowError(RuntimeError):
     pass
 
 
+class AuthenticationRejectedError(FlowError):
+    pass
+
+
 class AppleDeveloperServiceError(FlowError):
     def __init__(self, result_code: int, message: str, payload: dict[str, Any]) -> None:
         super().__init__(f"Apple developer service error {result_code}: {message}")
@@ -1301,7 +1305,7 @@ class AppleDeveloperClient:
         if error_code == 0:
             return dictionary
         if error_code in {-20101, -22406}:
-            raise FlowError("Apple rejected the username or password.")
+            raise AuthenticationRejectedError("Apple rejected the username or password.")
         if error_code == -22421:
             raise FlowError("Apple rejected the anisette data. Try --reset-anisette-cache.")
         if not response.ok:
@@ -1731,13 +1735,49 @@ def resolve_password(args: argparse.Namespace, parser: argparse.ArgumentParser) 
         args.password = os.environ.get(args.password_env)
         if not args.password:
             parser.error(f"Environment variable {args.password_env} is empty or not set.")
+        args.password_source = f"env:{args.password_env}"
     elif args.password_stdin:
         args.password = sys.stdin.readline().rstrip("\r\n")
         if not args.password:
             parser.error("--password-stdin did not provide a password.")
+        args.password_source = "stdin"
     else:
         require_interactive("Apple ID password")
         args.password = getpass.getpass("Apple ID password: ")
+        args.password_source = "prompt"
+
+
+def password_debug_summary(args: argparse.Namespace) -> dict[str, Any]:
+    password = getattr(args, "password", "")
+    source = getattr(args, "password_source", "unknown")
+    summary: dict[str, Any] = {
+        "source": source,
+        "length": len(password),
+        "sha256_prefix": hashlib.sha256(password.encode("utf-8")).hexdigest()[:12],
+    }
+    if len(password) >= 2 and password[0] == password[-1] and password[0] in {"'", '"'}:
+        summary["warning"] = "password value includes matching quote characters at both ends"
+    elif password != password.strip():
+        summary["warning"] = "password value includes leading or trailing whitespace"
+    return summary
+
+
+def retry_env_password_interactively(args: argparse.Namespace, debug: DebugPrinter) -> bool:
+    source = getattr(args, "password_source", "")
+    if not source.startswith("env:") or not sys.stdin.isatty():
+        return False
+
+    print(
+        "Apple rejected the password read from the environment. "
+        "Re-enter it once to rule out CMD/env escaping.",
+        file=sys.stderr,
+    )
+    args.password = getpass.getpass("Apple ID password retry: ")
+    if not args.password:
+        raise FlowError("Password retry did not provide a password.")
+    args.password_source = "prompt-after-env-reject"
+    debug("Password debug", password_debug_summary(args), secret=True)
+    return True
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -1876,7 +1916,13 @@ def main() -> int:
 
     if account is None or session is None:
         resolve_password(args, parser)
-        account, session = client.authenticate(args.apple_id, args.password, verification_prompt)
+        debug("Password debug", password_debug_summary(args), secret=True)
+        try:
+            account, session = client.authenticate(args.apple_id, args.password, verification_prompt)
+        except AuthenticationRejectedError:
+            if not retry_env_password_interactively(args, debug):
+                raise
+            account, session = client.authenticate(args.apple_id, args.password, verification_prompt)
         if session_store is not None:
             session_store.save(args.apple_id, session)
 
