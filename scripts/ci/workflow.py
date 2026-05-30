@@ -139,7 +139,31 @@ def clean_spm_cache():
 # BUILD
 # ----------------------------------------------------------
 
+def patch_ldid_padding_assertion():
+    path = ROOT / "Dependencies/AltSign/Dependencies/ldid/ldid.cpp"
+    old = (
+        b"                _assert(end <= size);\n"
+        b"                _assert(end >= size - 0x10);\n"
+        b"                size = end;\n"
+    )
+    new = (
+        b"                _assert(end <= size);\n"
+        b"                // Some Mach-O files leave more than 0x10 bytes of padding\n"
+        b"                // between LC_SYMTAB and LC_CODE_SIGNATURE.\n"
+        b"                size = end;\n"
+    )
+
+    data = path.read_bytes()
+    if new in data:
+        return
+
+    if old not in data:
+        raise SystemExit(f"Unable to patch ldid padding assertion in {path}")
+
+    path.write_bytes(data.replace(old, new, 1))
+
 def build():
+    patch_ldid_padding_assertion()
     run("mkdir -p build/logs")
     run(
         "set -o pipefail && "
@@ -155,6 +179,7 @@ def build():
 # ----------------------------------------------------------
 
 def tests_build():
+    patch_ldid_padding_assertion()
     run("mkdir -p build/logs")
     run(
         "NSUnbufferedIO=YES make -B build-tests "
