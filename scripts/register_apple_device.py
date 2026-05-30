@@ -533,7 +533,9 @@ class AppleSRP:
         else:
             password_input = password_digest
 
-        x_bytes = hashlib.pbkdf2_hmac("sha256", password_input, salt, iterations, dklen=32)
+        # Match AltSign/CoreCrypto: GSA PBKDF2 output is passed to ccsrp_generate_x with noUsernameInX=true.
+        derived_password_key = hashlib.pbkdf2_hmac("sha256", password_input, salt, iterations, dklen=32)
+        x_bytes = sha256(salt + sha256(b":" + derived_password_key))
         x = bytes_to_int(x_bytes)
 
         padded_g = int_to_bytes(self.g, self.n_len)
