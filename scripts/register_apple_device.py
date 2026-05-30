@@ -313,7 +313,6 @@ def sanitize_error_body(text: str) -> str:
         (r"([A-Za-z0-9_.-]*token[A-Za-z0-9_.-]*\s*[:=]\s*)[A-Za-z0-9+/=_.:-]+", True),
         (r"([A-Za-z0-9_.-]*adi[A-Za-z0-9_.-]*\s*[:=]\s*)[A-Za-z0-9+/=_.:-]+", True),
         (r"([A-Za-z0-9_.-]*identifier[A-Za-z0-9_.-]*\s*[:=]\s*)[A-Za-z0-9+/=_.:-]+", True),
-        (r"([A-Fa-f0-9]{8}-[A-Fa-f0-9]{16}|[A-Fa-f0-9]{40})", False),
     ]
     for pattern, has_prefix in patterns:
         body = re.sub(
@@ -329,7 +328,7 @@ def public_payload_preview(value: Any) -> Any:
     if isinstance(value, dict):
         preview: dict[str, Any] = {}
         for key, item in value.items():
-            if str(key) in {"deviceNumber", "identifier", "teamId", "personId", "email"}:
+            if str(key) in {"identifier", "teamId", "personId", "email"}:
                 preview[str(key)] = "<redacted>"
             elif isinstance(item, (dict, list)):
                 preview[str(key)] = f"<{type(item).__name__}>"
@@ -1605,6 +1604,35 @@ def classify_team(team: dict[str, Any]) -> str:
     return team_type
 
 
+def summarize_registered_devices(devices: list[dict[str, Any]], team: dict[str, Any], *, show_raw: bool) -> None:
+    print()
+    print("Registered Devices")
+    print("------------------")
+    print(f"Total: {len(devices)}")
+    if not devices:
+        print("No devices are registered in this Apple developer team.")
+        print_team_duration(team)
+        return
+
+    for index, device in enumerate(devices, start=1):
+        status_field = first_present(
+            device,
+            ["status", "deviceStatus", "approvalStatus", "enabled", "isEnabled"],
+        )
+        status = status_field[1] if status_field is not None else "(unknown)"
+        print()
+        print(f"{index}. {device.get('name', '(unknown)')}")
+        print(f"   UDID: {device.get('deviceNumber', '(unknown)')}")
+        print(f"   Model: {device.get('model', '(unknown)')}")
+        print(f"   Class: {device.get('deviceClass', '(unknown)')}")
+        print(f"   Apple status: {status}")
+        if show_raw:
+            print("   Raw:")
+            print(json.dumps(device, indent=2, sort_keys=True, default=str))
+
+    print_team_duration(team)
+
+
 def summarize_device_status(device: dict[str, Any] | None, team: dict[str, Any], *, show_raw: bool) -> None:
     print()
     print("Device Status")
@@ -1723,14 +1751,6 @@ def prompt_missing(args: argparse.Namespace, parser: argparse.ArgumentParser, *,
                 break
             print("Enter 1 or 2.")
 
-    if not args.udid:
-        require_interactive("--udid")
-        args.udid = input("Device UDID: ").strip()
-
-    if args.mode == "add" and not args.device_name:
-        require_interactive("--device-name")
-        args.device_name = input("Device name [iPhone]: ").strip() or "iPhone"
-
     if not args.apple_id:
         require_interactive("--apple-id")
         args.apple_id = input("Apple ID email: ").strip()
@@ -1795,10 +1815,30 @@ def retry_env_password_interactively(args: argparse.Namespace, debug: DebugPrint
     return True
 
 
+def prompt_add_udid(args: argparse.Namespace, parser: argparse.ArgumentParser) -> str:
+    if args.udid:
+        return normalize_udid(args.udid)
+    if not sys.stdin.isatty():
+        parser.error("--udid is required for --mode add in non-interactive mode.")
+    args.udid = input("Device UDID to register: ").strip()
+    return normalize_udid(args.udid)
+
+
+def prompt_add_device_name(args: argparse.Namespace, parser: argparse.ArgumentParser, udid: str) -> str:
+    if args.device_name:
+        return args.device_name
+    if not sys.stdin.isatty():
+        args.device_name = "iPhone"
+        return args.device_name
+    default_name = udid
+    args.device_name = input(f"Device name [{default_name}]: ").strip() or default_name
+    return args.device_name
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Register or check an Apple developer device.")
+    parser = argparse.ArgumentParser(description="List, check, or register Apple developer devices.")
     parser.add_argument("--mode", choices=["add", "check"], help="Action to perform. Omit for an interactive menu.")
-    parser.add_argument("--udid", help="Target iPhone/iPad UDID.")
+    parser.add_argument("--udid", help="Target iPhone/iPad UDID. Optional for check mode; add mode prompts for it after login if omitted.")
     parser.add_argument("--device-name", help="Device name to send when registering.")
     parser.add_argument("--apple-id", help="Apple ID email.")
     parser.add_argument("--password-env", help="Read Apple ID password from this environment variable.")
@@ -1840,10 +1880,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--reset-session-cache", action="store_true", help="Delete the cached Apple session for this Apple ID before running.")
     parser.add_argument("--no-session-cache", action="store_true", help="Do not read or save cached Apple developer login tokens.")
-    parser.set_defaults(debug=True)
-    parser.add_argument("--debug", dest="debug", action="store_true", help="Print verbose debug logs. Enabled by default; secrets are redacted.")
-    parser.add_argument("--quiet", dest="debug", action="store_false", help="Disable debug logs.")
-    parser.add_argument("--raw", action="store_true", help="Print raw device records even when --quiet is used.")
+    parser.set_defaults(debug=False)
+    parser.add_argument("--debug", dest="debug", action="store_true", help="Print verbose debug logs. Secrets are redacted by default.")
+    parser.add_argument("--quiet", dest="debug", action="store_false", help="Disable debug logs. This is the default.")
+    parser.add_argument("--raw", action="store_true", help="Print raw Apple device records in check output.")
     parser.add_argument(
         "--unsafe-debug-secrets",
         action="store_true",
@@ -1886,7 +1926,7 @@ def main() -> int:
     debug = DebugPrinter(enabled=args.debug, unsafe_secrets=args.unsafe_debug_secrets)
     verify = configure_tls(args.tls_trust_store, args.ca_bundle, args.allow_insecure_tls, debug)
     verify = ensure_apple_tls_or_prompt(verify, debug)
-    udid = normalize_udid(args.udid)
+    udid = normalize_udid(args.udid) if args.udid else None
     cache_path = Path(args.cache)
     session_store = None if args.no_session_cache else SessionStore(Path(args.session_cache), debug)
     if args.reset_session_cache and session_store is not None:
@@ -1899,7 +1939,8 @@ def main() -> int:
     )
 
     debug("Mode", args.mode)
-    debug("Target UDID", udid)
+    if udid is not None:
+        debug("Target UDID", udid)
     debug("Anisette URL", args.anisette_url)
     debug("Anisette mode", args.anisette_mode)
     debug("Anisette cache path", str(cache_path))
@@ -1952,11 +1993,18 @@ def main() -> int:
     print(f"Using team: {team.get('name')} ({team_id})")
 
     devices = client.fetch_devices(team_id, session)
-    existing = find_device(devices, udid)
 
     if args.mode == "check":
-        summarize_device_status(existing, team, show_raw=args.raw)
+        if udid is None:
+            summarize_registered_devices(devices, team, show_raw=args.raw)
+        else:
+            summarize_device_status(find_device(devices, udid), team, show_raw=args.raw)
         return 0
+
+    print()
+    print(f"Registered devices in this team: {len(devices)}")
+    udid = prompt_add_udid(args, parser)
+    existing = find_device(devices, udid)
 
     if existing is not None:
         print()
@@ -1964,10 +2012,11 @@ def main() -> int:
         summarize_device_status(existing, team, show_raw=args.raw)
         return 0
 
+    device_name = prompt_add_device_name(args, parser, udid)
     print()
-    print(f"Registering device {args.device_name} ({udid})...")
+    print(f"Registering device {device_name} ({udid})...")
     try:
-        added = client.add_device(team_id, udid, args.device_name, session)
+        added = client.add_device(team_id, udid, device_name, session)
     except AppleDeveloperServiceError as exc:
         if exc.result_code == 35:
             apple_message = str(exc)
