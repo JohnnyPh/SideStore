@@ -443,6 +443,46 @@ def format_request_exception(exc: requests.RequestException) -> str:
     )
 
 
+def is_tls_verification_error(exc: BaseException) -> bool:
+    message = str(exc)
+    return (
+        "CERTIFICATE_VERIFY_FAILED" in message
+        or "trust provider" in message
+        or "certificate verify failed" in message.lower()
+    )
+
+
+def ensure_apple_tls_or_prompt(verify: TLSVerify, debug: DebugPrinter) -> TLSVerify:
+    if verify is False:
+        return verify
+
+    probe = requests.Session()
+    if verify is not None:
+        probe.verify = verify
+    try:
+        probe.get(GSA_SERVICE_URL, timeout=10)
+        return verify
+    except requests.RequestException as exc:
+        if not is_tls_verification_error(exc):
+            debug("Apple TLS probe failed without certificate error", format_request_exception(exc))
+            return verify
+
+        print(format_request_exception(exc), file=sys.stderr)
+        if not sys.stdin.isatty():
+            return verify
+
+        answer = input("Disable TLS verification for this run and continue? [y/N]: ").strip().lower()
+        if answer in {"y", "yes"}:
+            requests.packages.urllib3.disable_warnings()
+            print(
+                "WARNING: TLS certificate verification is disabled for this run.",
+                file=sys.stderr,
+            )
+            debug("TLS certificate verification", "disabled after interactive prompt")
+            return False
+        return verify
+
+
 def sha256(data: bytes) -> bytes:
     return hashlib.sha256(data).digest()
 
@@ -656,11 +696,21 @@ class AnisetteData:
 
 
 class AnisetteClient:
-    def __init__(self, base_url: str, cache_path: Path, debug: DebugPrinter, verify: TLSVerify = None) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        cache_path: Path,
+        debug: DebugPrinter,
+        verify: TLSVerify = None,
+        mode: str = "auto",
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.cache_path = cache_path
         self.debug = debug
         self.verify = verify
+        self.mode = mode
+        self.force_v1_for_run = False
+        self.warned_v1 = False
         self.http = requests.Session()
         if verify is not None:
             self.http.verify = verify
@@ -670,6 +720,19 @@ class AnisetteClient:
         self.adi_pb: str | None = None
 
     def load_or_create(self, reset: bool = False) -> AnisetteData:
+        if self.mode == "v1" or self.force_v1_for_run:
+            return self._fetch_v1_headers()
+
+        try:
+            return self._load_or_create_v3(reset=reset)
+        except FlowError as exc:
+            if self.mode == "v3":
+                raise
+            self.debug("Anisette V3 failed; falling back to V1 endpoint", str(exc))
+            self.force_v1_for_run = True
+            return self._fetch_v1_headers()
+
+    def _load_or_create_v3(self, reset: bool = False) -> AnisetteData:
         if reset and self.cache_path.exists():
             self.debug("Deleting anisette cache", str(self.cache_path))
             self.cache_path.unlink()
@@ -679,6 +742,45 @@ class AnisetteClient:
         if not self.adi_pb:
             self._provision()
         return self._fetch_headers()
+
+    def _fetch_v1_headers(self) -> AnisetteData:
+        if not self.warned_v1:
+            print(
+                "WARNING: using anisette V1 fallback because V3 provisioning is unavailable. "
+                "Prefer V3 when the server and network support it.",
+                file=sys.stderr,
+            )
+            self.warned_v1 = True
+
+        self.debug("Fetching anisette V1 headers", self.base_url)
+        try:
+            response = self.http.get(self.base_url, timeout=30)
+        except requests.RequestException as exc:
+            raise FlowError(f"Could not fetch anisette V1 headers: {format_request_exception(exc)}") from exc
+        self.debug("anisette V1 status", response.status_code)
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise FlowError("Anisette V1 endpoint did not return JSON.") from exc
+        if not isinstance(payload, dict):
+            raise FlowError("Anisette V1 endpoint did not return a JSON object.")
+        if not response.ok:
+            message = payload.get("message") if isinstance(payload.get("message"), str) else response.text[:500]
+            raise FlowError(f"Anisette V1 endpoint returned HTTP {response.status_code}: {message}")
+        self.debug("anisette V1 response", payload, secret=True)
+
+        return AnisetteData(
+            machine_id=require_field(payload, "X-Apple-I-MD-M", str, "Anisette V1 headers"),
+            one_time_password=require_field(payload, "X-Apple-I-MD", str, "Anisette V1 headers"),
+            routing_info=str(parse_int(require_field(payload, "X-Apple-I-MD-RINFO", (str, int), "Anisette V1 headers"), "Anisette V1 headers")),
+            local_user_id=require_field(payload, "X-Apple-I-MD-LU", str, "Anisette V1 headers"),
+            device_unique_identifier=require_field(payload, "X-Mme-Device-Id", str, "Anisette V1 headers"),
+            device_serial_number=str(payload.get("X-Apple-I-SRL-NO") or "0"),
+            device_description=require_field(payload, "X-MMe-Client-Info", str, "Anisette V1 headers"),
+            date=str(payload.get("X-Apple-I-Client-Time") or now_iso_z()),
+            locale=str(payload.get("X-Apple-Locale") or local_locale()),
+            time_zone=str(payload.get("X-Apple-I-TimeZone") or local_timezone_name()),
+        )
 
     def _load_cache(self) -> None:
         if not self.cache_path.exists():
@@ -1649,6 +1751,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--2fa-stdin", dest="two_factor_stdin", action="store_true", help="Read verification code from stdin when prompted.")
     parser.add_argument("--team-id", help="Apple developer team ID. Omit to auto-select or prompt.")
     parser.add_argument("--anisette-url", default=DEFAULT_ANISETTE_URL, help="SideStore anisette server URL.")
+    parser.add_argument(
+        "--anisette-mode",
+        choices=["auto", "v3", "v1"],
+        default="auto",
+        help="Anisette protocol mode. auto tries V3 and falls back to V1 if provisioning fails.",
+    )
     parser.add_argument("--allow-insecure-anisette-http", action="store_true", help="Allow http:// anisette URLs for local testing only.")
     parser.add_argument(
         "--tls-trust-store",
@@ -1720,6 +1828,7 @@ def main() -> int:
 
     debug = DebugPrinter(enabled=args.debug, unsafe_secrets=args.unsafe_debug_secrets)
     verify = configure_tls(args.tls_trust_store, args.ca_bundle, args.allow_insecure_tls, debug)
+    verify = ensure_apple_tls_or_prompt(verify, debug)
     udid = normalize_udid(args.udid)
     cache_path = Path(args.cache)
     session_store = None if args.no_session_cache else SessionStore(Path(args.session_cache), debug)
@@ -1735,11 +1844,12 @@ def main() -> int:
     debug("Mode", args.mode)
     debug("Target UDID", udid)
     debug("Anisette URL", args.anisette_url)
+    debug("Anisette mode", args.anisette_mode)
     debug("Anisette cache path", str(cache_path))
     if session_store is not None:
         debug("Apple session cache path", str(session_store.path))
 
-    anisette_client = AnisetteClient(args.anisette_url, cache_path, debug, verify=verify)
+    anisette_client = AnisetteClient(args.anisette_url, cache_path, debug, verify=verify, mode=args.anisette_mode)
     anisette = anisette_client.load_or_create(reset=args.reset_anisette_cache)
     debug("Resolved anisette data", anisette.__dict__, secret=True)
 
