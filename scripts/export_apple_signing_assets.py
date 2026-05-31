@@ -70,7 +70,7 @@ DEFAULT_BUNDLE_IDENTIFIER = "*"
 DEFAULT_APP_ID_NAME = "SideStore Wildcard"
 DEFAULT_MACHINE_NAME = "SideStore Windows Export"
 SERVICES_BASE_URL = "https://developerservices2.apple.com/services/v1/"
-DEFAULT_CERTIFICATE_TYPE = "distribution"
+DEFAULT_CERTIFICATE_TYPE = "auto"
 CERTIFICATE_CONFIGS = {
     "development": {
         "display_name": "iOS Development",
@@ -97,6 +97,35 @@ NETWORK_EXTENSION_PROVIDERS = [
     "url-filter-provider",
     "hotspot-provider",
 ]
+PROFILE_PLATFORM_CONFIGS = {
+    "ios": {
+        "display_name": "iOS/iPadOS",
+        "filename": "SideStoreWildcard-iOS.mobileprovision",
+        "legacy_filename": "SideStoreWildcard.mobileprovision",
+        "device_classes": {"iphone", "ipad", "ipod", "ipodtouch"},
+        "parameter_attempts": [{"DTDK_Platform": "ios"}],
+    },
+    "tvos": {
+        "display_name": "tvOS",
+        "filename": "SideStoreWildcard-tvOS.mobileprovision",
+        "device_classes": {"tvos", "appletv", "appletvdevice"},
+        "parameter_attempts": [{"DTDK_Platform": "tvos", "subPlatform": "tvOS"}],
+    },
+    "visionos": {
+        "display_name": "visionOS",
+        "filename": "SideStoreWildcard-visionOS.mobileprovision",
+        "device_classes": {"vision", "visionos", "xros", "realitydevice"},
+        "parameter_attempts": [
+            {"DTDK_Platform": "xros", "subPlatform": "xrOS"},
+            {"DTDK_Platform": "visionos", "subPlatform": "visionOS"},
+        ],
+    },
+}
+DEFAULT_PROFILE_PLATFORMS = "auto"
+PROFILE_PLATFORM_ALIASES = {
+    "ipados": "ios",
+    "xros": "visionos",
+}
 MAXIMUM_CAPABILITIES = [
     "INCREASED_MEMORY_LIMIT",
     "INCREASED_MEMORY_LIMIT_DEBUGGING",
@@ -120,9 +149,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--machine-name", default=DEFAULT_MACHINE_NAME, help="Machine name Apple stores on the new certificate.")
     parser.add_argument(
         "--certificate-type",
-        choices=sorted(CERTIFICATE_CONFIGS),
+        choices=["auto", *sorted(CERTIFICATE_CONFIGS)],
         default=DEFAULT_CERTIFICATE_TYPE,
-        help=f"Certificate type to create. Default: {DEFAULT_CERTIFICATE_TYPE}.",
+        help=(
+            "Certificate type to create. auto tries distribution first and falls back to development "
+            f"when Apple reports the team is not eligible for distribution. Default: {DEFAULT_CERTIFICATE_TYPE}."
+        ),
     )
     parser.add_argument(
         "--skip-max-entitlements",
@@ -136,6 +168,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--p12-password", default="", help="Password for the exported .p12. Default: blank.")
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="Directory for exported signing files.")
+    parser.add_argument(
+        "--profile-platforms",
+        default=DEFAULT_PROFILE_PLATFORMS,
+        help=(
+            "Comma-separated provisioning profile platforms to export: auto, all, ios, ipados, tvos, visionos, xros. "
+            f"Default: {DEFAULT_PROFILE_PLATFORMS}."
+        ),
+    )
     parser.add_argument("--udid", help="Optional device UDID to ensure is registered before downloading the profile.")
     parser.add_argument("--device-name", help="Device name to send when registering --udid.")
     parser.add_argument("--save-pem", action="store_true", help="Also write certificate.pem and private_key.pem. These are sensitive.")
@@ -184,6 +224,34 @@ def require_interactive(parser: argparse.ArgumentParser, label: str) -> None:
         parser.error(f"{label} is required in non-interactive mode.")
 
 
+def parse_profile_platforms(value: str, parser: argparse.ArgumentParser) -> list[str] | str:
+    platforms = [
+        PROFILE_PLATFORM_ALIASES.get(platform.strip().lower(), platform.strip().lower())
+        for platform in value.split(",")
+        if platform.strip()
+    ]
+    if not platforms:
+        parser.error("--profile-platforms must not be empty.")
+    if "auto" in platforms:
+        if len(platforms) > 1:
+            parser.error("Use --profile-platforms auto by itself.")
+        return "auto"
+    if "all" in platforms:
+        if len(platforms) > 1:
+            parser.error("Use --profile-platforms all by itself.")
+        return list(PROFILE_PLATFORM_CONFIGS)
+
+    unknown = [platform for platform in platforms if platform not in PROFILE_PLATFORM_CONFIGS]
+    if unknown:
+        parser.error(f"Unknown --profile-platforms value: {', '.join(unknown)}.")
+
+    deduplicated: list[str] = []
+    for platform in platforms:
+        if platform not in deduplicated:
+            deduplicated.append(platform)
+    return deduplicated
+
+
 def validate_arguments(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     if args.password_env and args.password_stdin:
         parser.error("Use only one of --password-env or --password-stdin.")
@@ -204,6 +272,8 @@ def validate_arguments(args: argparse.Namespace, parser: argparse.ArgumentParser
 
     if args.udid:
         args.udid = normalize_udid(args.udid)
+
+    args.profile_platforms = parse_profile_platforms(args.profile_platforms, parser)
 
     validate_https_url(args.anisette_url, allow_http=args.allow_insecure_anisette_http)
 
@@ -275,7 +345,7 @@ def authenticate(args: argparse.Namespace, parser: argparse.ArgumentParser):
     team_id = require_field(team, "teamId", str, "Apple team selection")
     print(f"Using team: {team.get('name')} ({team_id})")
 
-    return client, session, team_id
+    return client, session, team
 
 
 def generate_certificate_request():
@@ -487,6 +557,98 @@ def replace_existing_certificates(
     )
 
 
+def distribution_not_eligible_error() -> FlowError:
+    return FlowError(
+        "Apple rejected iOS Distribution certificate creation for this team: the team is not eligible for "
+        "that feature. A local script cannot turn a free Xcode provisioning membership into a distribution "
+        "certificate because Apple must issue and sign that certificate."
+    )
+
+
+def is_xcode_free_team(team: dict[str, Any]) -> bool:
+    if bool(team.get("xcodeFreeOnly")):
+        return True
+
+    memberships = team.get("memberships")
+    if isinstance(memberships, list):
+        for membership in memberships:
+            if not isinstance(membership, dict):
+                continue
+            name = str(membership.get("name", "")).lower()
+            product_id = str(membership.get("membershipProductId", "")).lower()
+            if "free" in name or product_id == "fp22":
+                return True
+
+    member = team.get("currentTeamMember")
+    if isinstance(member, dict):
+        roles = member.get("roles")
+        if isinstance(roles, list) and any(str(role) == "XCODE_FREE_USER" for role in roles):
+            return True
+
+    return False
+
+
+def select_certificate_type(requested_certificate_type: str, team: dict[str, Any]) -> str:
+    if requested_certificate_type != "auto":
+        return requested_certificate_type
+
+    if is_xcode_free_team(team):
+        print("Team appears to use Xcode Free Provisioning; best available certificate type is iOS Development.")
+        return "development"
+
+    return "distribution"
+
+
+def certificate_type_attempts(requested_certificate_type: str) -> list[str]:
+    if requested_certificate_type == "auto":
+        return ["distribution", "development"]
+    return [requested_certificate_type]
+
+
+def create_best_available_certificate(
+    client: AppleDeveloperClient,
+    team_id: str,
+    session,
+    machine_name: str,
+    requested_certificate_type: str,
+    *,
+    allow_revoke_existing_certificate: bool,
+):
+    for certificate_type in certificate_type_attempts(requested_certificate_type):
+        display_certificate_type = certificate_display_type(certificate_type)
+        print()
+        print(f"Creating a new Apple {display_certificate_type} certificate...")
+        try:
+            result = create_certificate(client, team_id, session, machine_name, certificate_type)
+            return certificate_type, *result
+        except AppleDeveloperServiceError as exc:
+            if certificate_type == "distribution" and exc.result_code == 4100:
+                if requested_certificate_type == "auto":
+                    print("Apple reports this team is not eligible for iOS Distribution certificates.")
+                    print("Falling back to the best available option: iOS Development.")
+                    continue
+                raise distribution_not_eligible_error() from exc
+            if exc.result_code != 7460:
+                raise
+            if not allow_revoke_existing_certificate:
+                raise FlowError(
+                    f"Apple already has a current or pending {display_certificate_type} certificate for this team. "
+                    "Apple only stores the public certificate, so this script cannot export a usable P12 "
+                    "unless it creates the certificate from a local private key. Rerun with "
+                    "--allow-revoke-existing-certificate to replace the existing certificate and generate a matching P12."
+                ) from exc
+            result = replace_existing_certificates(
+                client,
+                team_id,
+                session,
+                machine_name,
+                certificate_type,
+            )
+            return certificate_type, *result
+
+    raise distribution_not_eligible_error()
+
+
 def create_certificate(client: AppleDeveloperClient, team_id: str, session, machine_name: str, certificate_type: str):
     private_key, csr_pem, private_key_pem = generate_certificate_request()
     response = client._send_developer_request(
@@ -568,39 +730,144 @@ def find_or_create_app_id(client: AppleDeveloperClient, team_id: str, session, b
     return app_id
 
 
-def maximum_entitlements(team_id: str, certificate_type: str, *, include_push: bool) -> dict[str, Any]:
+def maximum_entitlements(
+    team_id: str,
+    certificate_type: str,
+    *,
+    include_push: bool,
+    include_app_groups: bool,
+    include_network_extension: bool,
+    include_passbook: bool,
+    include_siri: bool,
+    include_icloud: bool,
+    include_inter_app_audio: bool,
+    include_data_protection: bool,
+) -> dict[str, Any]:
     wildcard_identifier = f"{team_id}.*"
     entitlements: dict[str, Any] = {
         "application-identifier": wildcard_identifier,
         "com.apple.developer.team-identifier": team_id,
         "keychain-access-groups": [wildcard_identifier, "com.apple.token"],
         "get-task-allow": bool(certificate_config(certificate_type)["get_task_allow"]),
-        "inter-app-audio": True,
-        "com.apple.developer.default-data-protection": "NSFileProtectionComplete",
-        "com.apple.developer.networking.networkextension": NETWORK_EXTENSION_PROVIDERS,
-        "com.apple.developer.pass-type-identifiers": [wildcard_identifier],
-        "com.apple.developer.siri": True,
-        "com.apple.developer.ubiquity-container-identifiers": [wildcard_identifier],
-        "com.apple.developer.ubiquity-kvstore-identifier": wildcard_identifier,
     }
     if include_push:
         entitlements["aps-environment"] = str(certificate_config(certificate_type)["aps_environment"])
+    if include_app_groups:
+        entitlements["com.apple.security.application-groups"] = [f"group.{team_id}.*"]
+    if include_inter_app_audio:
+        entitlements["inter-app-audio"] = True
+    if include_data_protection:
+        entitlements["com.apple.developer.default-data-protection"] = "NSFileProtectionComplete"
+    if include_network_extension:
+        entitlements["com.apple.developer.networking.networkextension"] = NETWORK_EXTENSION_PROVIDERS
+    if include_passbook:
+        entitlements["com.apple.developer.pass-type-identifiers"] = [wildcard_identifier]
+    if include_siri:
+        entitlements["com.apple.developer.siri"] = True
+    if include_icloud:
+        entitlements["com.apple.developer.ubiquity-container-identifiers"] = [wildcard_identifier]
+        entitlements["com.apple.developer.ubiquity-kvstore-identifier"] = wildcard_identifier
     return entitlements
 
 
-def maximum_feature_parameters(*, include_push: bool) -> dict[str, Any]:
-    parameters: dict[str, Any] = {
-        "dataProtection": "complete",
-        "iCloud": True,
-        "cloudKitVersion": 1,
-        "IAD53UNK2F": True,
-        "passbook": True,
-        "SI015DKUHP": True,
-        "NWEXT04537": True,
-    }
+def maximum_feature_parameters(
+    *,
+    include_push: bool,
+    include_app_groups: bool,
+    include_network_extension: bool,
+    include_passbook: bool,
+    include_siri: bool,
+    include_icloud: bool,
+    include_inter_app_audio: bool,
+    include_data_protection: bool,
+) -> dict[str, Any]:
+    parameters: dict[str, Any] = {}
     if include_push:
         parameters["push"] = True
+    if include_app_groups:
+        parameters["APG3427HIY"] = True
+    if include_inter_app_audio:
+        parameters["IAD53UNK2F"] = True
+    if include_data_protection:
+        parameters["dataProtection"] = "complete"
+    if include_network_extension:
+        parameters["NWEXT04537"] = True
+    if include_passbook:
+        parameters["passbook"] = True
+    if include_siri:
+        parameters["SI015DKUHP"] = True
+    if include_icloud:
+        parameters["iCloud"] = True
+        parameters["cloudKitVersion"] = 1
     return parameters
+
+
+def entitlement_attempts(certificate_type: str) -> list[dict[str, Any]]:
+    broad = {
+        "include_app_groups": True,
+        "include_network_extension": True,
+        "include_passbook": True,
+        "include_siri": True,
+        "include_icloud": True,
+        "include_inter_app_audio": True,
+        "include_data_protection": True,
+    }
+    return [
+        {
+            "label": "maximum wildcard entitlements including push notifications, app groups, NetworkExtension, iCloud, Siri, pass IDs, and inter-app audio",
+            "include_push": True,
+            "include_capabilities": True,
+            **broad,
+        },
+        {
+            "label": "maximum wildcard entitlements without push notifications",
+            "include_push": False,
+            "include_capabilities": True,
+            **broad,
+        },
+        {
+            "label": "appdb-style wildcard entitlements without kernel capability flags",
+            "include_push": False,
+            "include_capabilities": False,
+            **broad,
+        },
+        {
+            "label": "appdb-style wildcard entitlements without app groups",
+            "include_push": False,
+            "include_capabilities": False,
+            **{**broad, "include_app_groups": False},
+        },
+        {
+            "label": "wildcard entitlements without NetworkExtension",
+            "include_push": False,
+            "include_capabilities": False,
+            **{**broad, "include_app_groups": False, "include_network_extension": False},
+        },
+        {
+            "label": "free-team wildcard entitlements with data protection and inter-app audio",
+            "include_push": False,
+            "include_capabilities": False,
+            "include_app_groups": False,
+            "include_network_extension": False,
+            "include_passbook": False,
+            "include_siri": False,
+            "include_icloud": False,
+            "include_inter_app_audio": True,
+            "include_data_protection": True,
+        },
+        {
+            "label": "minimum wildcard entitlements",
+            "include_push": False,
+            "include_capabilities": False,
+            "include_app_groups": False,
+            "include_network_extension": False,
+            "include_passbook": False,
+            "include_siri": False,
+            "include_icloud": False,
+            "include_inter_app_audio": False,
+            "include_data_protection": False,
+        },
+    ]
 
 
 def update_app_id_for_maximum_entitlements(
@@ -611,20 +878,37 @@ def update_app_id_for_maximum_entitlements(
     certificate_type: str,
 ) -> dict[str, Any]:
     app_id_id = require_field(app_id, "appIdId", str, "Apple App ID")
-    attempts = [
-        ("maximum entitlements including push notifications", True),
-        ("maximum entitlements without push notifications", False),
-    ]
-
-    last_error: AppleDeveloperServiceError | None = None
-    for label, include_push in attempts:
+    last_error: Exception | None = None
+    for attempt in entitlement_attempts(certificate_type):
+        label = str(attempt["label"])
         print(f"Updating wildcard App ID with {label}...")
         parameters = {
             "appIdId": app_id_id,
-            **maximum_feature_parameters(include_push=include_push),
-            "capabilities": MAXIMUM_CAPABILITIES,
-            "entitlements": maximum_entitlements(team_id, certificate_type, include_push=include_push),
+            **maximum_feature_parameters(
+                include_push=bool(attempt["include_push"]),
+                include_app_groups=bool(attempt["include_app_groups"]),
+                include_network_extension=bool(attempt["include_network_extension"]),
+                include_passbook=bool(attempt["include_passbook"]),
+                include_siri=bool(attempt["include_siri"]),
+                include_icloud=bool(attempt["include_icloud"]),
+                include_inter_app_audio=bool(attempt["include_inter_app_audio"]),
+                include_data_protection=bool(attempt["include_data_protection"]),
+            ),
+            "entitlements": maximum_entitlements(
+                team_id,
+                certificate_type,
+                include_push=bool(attempt["include_push"]),
+                include_app_groups=bool(attempt["include_app_groups"]),
+                include_network_extension=bool(attempt["include_network_extension"]),
+                include_passbook=bool(attempt["include_passbook"]),
+                include_siri=bool(attempt["include_siri"]),
+                include_icloud=bool(attempt["include_icloud"]),
+                include_inter_app_audio=bool(attempt["include_inter_app_audio"]),
+                include_data_protection=bool(attempt["include_data_protection"]),
+            ),
         }
+        if bool(attempt["include_capabilities"]):
+            parameters["capabilities"] = MAXIMUM_CAPABILITIES
         try:
             response = client._send_developer_request(
                 "ios/updateAppId.action",
@@ -636,10 +920,15 @@ def update_app_id_for_maximum_entitlements(
             last_error = exc
             print(f"Apple rejected {label}: {exc}")
             continue
+        except FlowError as exc:
+            last_error = exc
+            print(f"Apple rejected {label}: {exc}")
+            continue
 
         updated_app_id = response.get("appId")
         if not isinstance(updated_app_id, dict):
             raise FlowError("Apple did not return the updated App ID.")
+        print(f"Apple accepted wildcard App ID update: {label}.")
         return updated_app_id
 
     if last_error is not None:
@@ -659,18 +948,84 @@ def profile_data_from_response(response: dict[str, Any]) -> tuple[bytes, dict[st
     raise FlowError("Apple returned a provisioning profile without encodedProfile data.")
 
 
-def download_provisioning_profile(client: AppleDeveloperClient, team_id: str, session, app_id: dict[str, Any]) -> tuple[bytes, dict[str, Any]]:
+def normalized_device_class(device: dict[str, Any]) -> str:
+    return str(device.get("deviceClass", "")).replace(" ", "").replace("-", "").lower()
+
+
+def device_ids_for_profile_platform(devices: list[dict[str, Any]], profile_platform: str) -> list[str]:
+    config = PROFILE_PLATFORM_CONFIGS[profile_platform]
+    device_classes = config["device_classes"]
+    return [
+        str(device["deviceId"])
+        for device in devices
+        if (
+            isinstance(device, dict)
+            and device.get("deviceId")
+            and normalized_device_class(device) in device_classes
+        )
+    ]
+
+
+def profile_platform_display_name(profile_platform: str) -> str:
+    return str(PROFILE_PLATFORM_CONFIGS[profile_platform]["display_name"])
+
+
+def profile_platform_parameter_attempts(profile_platform: str) -> list[dict[str, str]]:
+    return list(PROFILE_PLATFORM_CONFIGS[profile_platform]["parameter_attempts"])
+
+
+def resolve_profile_platforms(requested_platforms: list[str] | str, devices: list[dict[str, Any]]) -> list[str]:
+    if requested_platforms != "auto":
+        return requested_platforms
+
+    platforms = [
+        platform
+        for platform in PROFILE_PLATFORM_CONFIGS
+        if device_ids_for_profile_platform(devices, platform)
+    ]
+    if platforms:
+        return platforms
+    return ["ios"]
+
+
+def profile_filename(profile_platform: str) -> str:
+    return str(PROFILE_PLATFORM_CONFIGS[profile_platform]["filename"])
+
+
+def legacy_profile_filename(profile_platform: str) -> str | None:
+    legacy_filename = PROFILE_PLATFORM_CONFIGS[profile_platform].get("legacy_filename")
+    if isinstance(legacy_filename, str) and legacy_filename:
+        return legacy_filename
+    return None
+
+
+def download_provisioning_profile(
+    client: AppleDeveloperClient,
+    team_id: str,
+    session,
+    app_id: dict[str, Any],
+    profile_platform: str,
+) -> tuple[bytes, dict[str, Any]]:
     app_id_id = require_field(app_id, "appIdId", str, "Apple App ID")
-    response = client._send_developer_request(
-        "ios/downloadTeamProvisioningProfile.action",
-        team_id=team_id,
-        session=session,
-        additional_parameters={
-            "appIdId": app_id_id,
-            "DTDK_Platform": "ios",
-        },
-    )
-    return profile_data_from_response(response)
+    last_error: Exception | None = None
+    for parameters in profile_platform_parameter_attempts(profile_platform):
+        try:
+            response = client._send_developer_request(
+                "ios/downloadTeamProvisioningProfile.action",
+                team_id=team_id,
+                session=session,
+                additional_parameters={
+                    "appIdId": app_id_id,
+                    **parameters,
+                },
+            )
+            return profile_data_from_response(response)
+        except (AppleDeveloperServiceError, FlowError) as exc:
+            last_error = exc
+            continue
+    if last_error is not None:
+        raise last_error
+    raise FlowError(f"No platform parameters are configured for {profile_platform_display_name(profile_platform)}.")
 
 
 def download_profile_by_id(client: AppleDeveloperClient, team_id: str, session, profile_id: str) -> tuple[bytes, dict[str, Any]]:
@@ -685,33 +1040,50 @@ def download_profile_by_id(client: AppleDeveloperClient, team_id: str, session, 
     return profile_data_from_response(response)
 
 
-def create_distribution_provisioning_profile(
+def create_limited_provisioning_profile(
     client: AppleDeveloperClient,
     team_id: str,
     session,
     app_id: dict[str, Any],
     certificate_id: str,
+    certificate_type: str,
+    profile_platform: str,
+    devices: list[dict[str, Any]],
 ) -> tuple[bytes, dict[str, Any]]:
     app_id_id = require_field(app_id, "appIdId", str, "Apple App ID")
-    devices = client.fetch_devices(team_id, session)
-    device_ids = [str(device["deviceId"]) for device in devices if isinstance(device, dict) and device.get("deviceId")]
+    device_ids = device_ids_for_profile_platform(devices, profile_platform)
     if not device_ids:
-        raise FlowError("Apple did not return any registered device IDs for an ad hoc distribution profile.")
+        raise FlowError(
+            f"Apple did not return any registered {profile_platform_display_name(profile_platform)} device IDs "
+            "for a limited provisioning profile."
+        )
 
-    print(f"Creating wildcard ad hoc distribution profile for {len(device_ids)} registered device(s)...")
-    response = client._send_developer_request(
-        "ios/createProvisioningProfile.action",
-        team_id=team_id,
-        session=session,
-        additional_parameters={
-            "provisioningProfileName": "SideStore Wildcard Distribution",
-            "appIdId": app_id_id,
-            "certificateIds": [certificate_id],
-            "deviceIds": device_ids,
-            "distributionType": "limited",
-            "DTDK_Platform": "ios",
-        },
-    )
+    display_certificate_type = certificate_display_type(certificate_type)
+    platform_name = profile_platform_display_name(profile_platform)
+    print(f"Creating wildcard limited {display_certificate_type} {platform_name} profile for {len(device_ids)} registered device(s)...")
+    last_error: Exception | None = None
+    for parameters in profile_platform_parameter_attempts(profile_platform):
+        try:
+            response = client._send_developer_request(
+                "ios/createProvisioningProfile.action",
+                team_id=team_id,
+                session=session,
+                additional_parameters={
+                    "provisioningProfileName": f"SideStore Wildcard {platform_name} {display_certificate_type}",
+                    "appIdId": app_id_id,
+                    "certificateIds": [certificate_id],
+                    "deviceIds": device_ids,
+                    "distributionType": "limited",
+                    **parameters,
+                },
+            )
+            break
+        except (AppleDeveloperServiceError, FlowError) as exc:
+            last_error = exc
+    else:
+        if last_error is not None:
+            raise last_error
+        raise FlowError(f"No platform parameters are configured for {platform_name}.")
 
     try:
         return profile_data_from_response(response)
@@ -753,7 +1125,7 @@ def serialize_p12(private_key, certificate: x509.Certificate, password: str) -> 
 def write_outputs(
     output_dir: Path,
     p12_data: bytes,
-    profile_data: bytes,
+    profile_exports: list[tuple[str, bytes, dict[str, Any]]],
     certificate_pem: bytes,
     private_key_pem: bytes,
     *,
@@ -763,11 +1135,26 @@ def write_outputs(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     p12_path = output_dir / "SideStoreSigningCertificate.p12"
-    profile_path = output_dir / "SideStoreWildcard.mobileprovision"
     readme_path = output_dir / "README.txt"
 
+    if not profile_exports:
+        raise FlowError("No provisioning profiles were exported.")
+
     p12_path.write_bytes(p12_data)
-    profile_path.write_bytes(profile_data)
+    profile_paths: list[Path] = []
+    for profile_platform, profile_data, _profile in profile_exports:
+        path = output_dir / profile_filename(profile_platform)
+        path.write_bytes(profile_data)
+        profile_paths.append(path)
+
+        legacy_filename = legacy_profile_filename(profile_platform)
+        if legacy_filename is not None:
+            legacy_path = output_dir / legacy_filename
+            legacy_path.write_bytes(profile_data)
+            if legacy_path not in profile_paths:
+                profile_paths.append(legacy_path)
+
+    profile_notes = [f"{path.name} password: none" for path in profile_paths]
     readme_path.write_text(
         "\n".join(
             [
@@ -775,7 +1162,7 @@ def write_outputs(
                 "",
                 f"Generated at: {dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}",
                 f"SideStoreSigningCertificate.p12 password: {'provided by --p12-password' if p12_password else 'leave blank'}",
-                "SideStoreWildcard.mobileprovision password: none",
+                *profile_notes,
                 "",
             ]
         ),
@@ -789,7 +1176,8 @@ def write_outputs(
     print()
     print("Exported signing assets:")
     print(f"  P12: {p12_path}")
-    print(f"  Profile: {profile_path}")
+    for profile_path in profile_paths:
+        print(f"  Profile: {profile_path}")
     print(f"  Notes: {readme_path}")
     if save_pem:
         print(f"  Certificate PEM: {output_dir / 'certificate.pem'}")
@@ -827,66 +1215,84 @@ def main() -> int:
     args = parser.parse_args()
     validate_arguments(args, parser)
 
-    client, session, team_id = authenticate(args, parser)
+    client, session, team = authenticate(args, parser)
+    team_id = require_field(team, "teamId", str, "Apple team selection")
+    selected_certificate_type = select_certificate_type(args.certificate_type, team)
 
     if args.udid:
         ensure_device_registered(client, team_id, session, args.udid, args.device_name)
 
-    display_certificate_type = certificate_display_type(args.certificate_type)
-    print()
-    print(f"Creating a new Apple {display_certificate_type} certificate...")
-    try:
-        private_key, private_key_pem, certificate, certificate_data, certificate_response = create_certificate(
-            client,
-            team_id,
-            session,
-            args.machine_name,
-            args.certificate_type,
-        )
-    except AppleDeveloperServiceError as exc:
-        if args.certificate_type == "distribution" and exc.result_code == 4100:
-            raise FlowError(
-                "Apple rejected iOS Distribution certificate creation for this team: the team is not eligible for "
-                "that feature. A local script cannot turn a free Xcode provisioning membership into a distribution "
-                "certificate because Apple must issue and sign that certificate."
-            ) from exc
-        if exc.result_code != 7460:
-            raise
-        if not args.allow_revoke_existing_certificate:
-            raise FlowError(
-                f"Apple already has a current or pending {display_certificate_type} certificate for this team. "
-                "Apple only stores the public certificate, so this script cannot export a usable P12 "
-                "unless it creates the certificate from a local private key. Rerun with "
-                "--allow-revoke-existing-certificate to replace the existing certificate and generate a matching P12."
-            ) from exc
-        private_key, private_key_pem, certificate, certificate_data, certificate_response = replace_existing_certificates(
-            client,
-            team_id,
-            session,
-            args.machine_name,
-            args.certificate_type,
-        )
+    app_id = find_or_create_app_id(client, team_id, session, args.bundle_id, args.app_id_name)
+    if not args.skip_max_entitlements:
+        app_id = update_app_id_for_maximum_entitlements(client, team_id, session, app_id, selected_certificate_type)
+
+    requested_certificate_type = selected_certificate_type
+    if args.certificate_type == "auto" and selected_certificate_type == "distribution":
+        requested_certificate_type = "auto"
+
+    (
+        certificate_type,
+        private_key,
+        private_key_pem,
+        certificate,
+        certificate_data,
+        certificate_response,
+    ) = create_best_available_certificate(
+        client,
+        team_id,
+        session,
+        args.machine_name,
+        requested_certificate_type,
+        allow_revoke_existing_certificate=args.allow_revoke_existing_certificate,
+    )
     serial_number = format(certificate.serial_number, "X").lstrip("0")
     print(f"Created certificate serial: {serial_number}")
 
-    app_id = find_or_create_app_id(client, team_id, session, args.bundle_id, args.app_id_name)
-    if not args.skip_max_entitlements:
-        app_id = update_app_id_for_maximum_entitlements(client, team_id, session, app_id, args.certificate_type)
+    if certificate_type != selected_certificate_type and not args.skip_max_entitlements:
+        app_id = update_app_id_for_maximum_entitlements(client, team_id, session, app_id, certificate_type)
 
-    if args.certificate_type == "distribution":
-        certificate_id = certificate_identifier_from_response(certificate_response)
-        if certificate_id is None:
-            raise FlowError("Apple did not return the distribution certificate ID needed for the provisioning profile.")
-        profile_data, profile = create_distribution_provisioning_profile(client, team_id, session, app_id, certificate_id)
-    else:
-        profile_data, profile = download_provisioning_profile(client, team_id, session, app_id)
-    print(f"Downloaded profile: {profile.get('name') or profile.get('provisioningProfileId') or args.bundle_id}")
+    certificate_id = certificate_identifier_from_response(certificate_response)
+    if certificate_id is None:
+        raise FlowError("Apple did not return the certificate ID needed for the provisioning profile.")
+
+    devices = client.fetch_devices(team_id, session)
+    profile_platforms = resolve_profile_platforms(args.profile_platforms, devices)
+    print(
+        "Provisioning profile platforms: "
+        + ", ".join(profile_platform_display_name(platform) for platform in profile_platforms)
+    )
+
+    profile_exports: list[tuple[str, bytes, dict[str, Any]]] = []
+    for profile_platform in profile_platforms:
+        try:
+            profile_data, profile = create_limited_provisioning_profile(
+                client,
+                team_id,
+                session,
+                app_id,
+                certificate_id,
+                certificate_type,
+                profile_platform,
+                devices,
+            )
+        except (AppleDeveloperServiceError, FlowError) as exc:
+            if certificate_type != "development":
+                raise
+            print(f"Apple rejected explicit limited {profile_platform_display_name(profile_platform)} development profile creation: {exc}")
+            print("Falling back to Apple team provisioning profile download.")
+            profile_data, profile = download_provisioning_profile(client, team_id, session, app_id, profile_platform)
+        print(
+            "Downloaded "
+            f"{profile_platform_display_name(profile_platform)} profile: "
+            f"{profile.get('name') or profile.get('provisioningProfileId') or args.bundle_id}"
+        )
+        profile_exports.append((profile_platform, profile_data, profile))
 
     p12_data = serialize_p12(private_key, certificate, args.p12_password)
     write_outputs(
         Path(args.output_dir),
         p12_data,
-        profile_data,
+        profile_exports,
         certificate.public_bytes(serialization.Encoding.PEM),
         private_key_pem,
         save_pem=args.save_pem,
