@@ -16,7 +16,7 @@ public func startEMProxy(bind_addr: String) {
     let host = NSString(string: bind_addr)
     guard let hostPointer = host.utf8String else { return }
 
-    _ = em_proxy.start_emotional_damage(hostPointer)
+    _ = start_emotional_damage(hostPointer)
     #endif
 }
 
@@ -24,6 +24,6 @@ public func stopEMProxy() {
     #if targetEnvironment(simulator)
     print("stopEMProxy() is no-op on simulator")
     #else
-    em_proxy.stop_emotional_damage()
+    stop_emotional_damage()
     #endif
 }
