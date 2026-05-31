@@ -66,10 +66,10 @@ from register_apple_device import (
 
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "signing-export"
 DEFAULT_BUNDLE_IDENTIFIER = "*"
-DEFAULT_APP_ID_NAME = "SideStore Wildcard"
-DEFAULT_MACHINE_NAME = "SideStore Windows Export"
+DEFAULT_APP_ID_NAME = "Wildcard"
+DEFAULT_MACHINE_NAME = "Windows Export"
 PRIMARY_P12_FILENAME = "Certificate.p12"
-P12_INPUT_FILENAMES = [PRIMARY_P12_FILENAME, "SideStoreSigningCertificate.p12"]
+P12_INPUT_FILENAMES = [PRIMARY_P12_FILENAME]
 SERVICES_BASE_URL = "https://developerservices2.apple.com/services/v1/"
 DEFAULT_CERTIFICATE_TYPE = "auto"
 CERTIFICATE_CONFIGS = {
@@ -192,7 +192,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--udid", help="Optional device UDID to ensure is registered before downloading the profile.")
     parser.add_argument("--device-name", help="Device name to send when registering --udid.")
     parser.add_argument("--save-pem", action="store_true", help="Also write certificate.pem and private_key.pem. These are sensitive.")
-    parser.add_argument("--anisette-url", default=DEFAULT_ANISETTE_URL, help="SideStore anisette server URL.")
+    parser.add_argument("--anisette-url", default=DEFAULT_ANISETTE_URL, help="Anisette server URL.")
     parser.add_argument(
         "--anisette-mode",
         choices=["auto", "v3", "v1"],
@@ -1300,8 +1300,8 @@ def create_limited_provisioning_profile(
     safe_platform_name = platform_name.replace("/", "-")
     certificate_suffix = re.sub(r"[^A-Za-z0-9]", "", certificate_id)[:8] or "cert"
     profile_names = [
-        f"SideStore Wildcard {platform_name} {display_certificate_type}",
-        f"SideStore Wildcard {safe_platform_name} {display_certificate_type} {certificate_suffix} {timestamp}",
+        f"Wildcard {platform_name} {display_certificate_type}",
+        f"Wildcard {safe_platform_name} {display_certificate_type} {certificate_suffix} {timestamp}",
     ]
     last_error: Exception | None = None
     response: dict[str, Any] | None = None
@@ -1370,7 +1370,7 @@ def serialize_p12(private_key, certificate: x509.Certificate, password: str) -> 
     else:
         encryption = serialization.NoEncryption()
     return pkcs12.serialize_key_and_certificates(
-        name=b"SideStore",
+        name=b"Signing Certificate",
         key=private_key,
         cert=certificate,
         cas=None,
@@ -1397,19 +1397,10 @@ def write_outputs(
 
     profile_paths = [output_dir / profile_filename(profile_platform) for profile_platform, _profile_data, _profile in profile_exports]
     current_outputs = {p12_path, *profile_paths}
-    stale_generated_filenames = {
-        "README.txt",
-        "SideStoreSigningCertificate.p12",
-        "SideStoreWildcard.mobileprovision",
-        "SideStoreWildcard-iOS.mobileprovision",
-        "SideStoreWildcard-tvOS.mobileprovision",
-        "SideStoreWildcard-visionOS.mobileprovision",
-        "Wildcard-tvOS.mobileprovision",
-        "Wildcard-visionOS.mobileprovision",
-    }
-    for filename in stale_generated_filenames:
-        stale_path = output_dir / filename
-        if stale_path not in current_outputs and stale_path.exists():
+    for stale_path in output_dir.iterdir():
+        if stale_path in current_outputs or not stale_path.is_file():
+            continue
+        if stale_path.suffix.lower() in {".p12", ".mobileprovision", ".txt"}:
             stale_path.unlink()
 
     p12_path.write_bytes(p12_data)
