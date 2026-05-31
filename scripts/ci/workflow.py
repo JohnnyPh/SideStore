@@ -51,6 +51,19 @@ def runAndGet(cmd, cwd=None):
 def getenv(name, default=""):
     return os.environ.get(name, default)
 
+def apply_git_patch_once(repo, patch):
+    repo_path = ROOT / repo
+    patch_path = ROOT / patch
+
+    if subprocess.run(["git", "-C", str(repo_path), "apply", "--check", str(patch_path)]).returncode == 0:
+        subprocess.run(["git", "-C", str(repo_path), "apply", str(patch_path)], check=True)
+        return
+
+    if subprocess.run(["git", "-C", str(repo_path), "apply", "--reverse", "--check", str(patch_path)]).returncode == 0:
+        return
+
+    raise SystemExit(f"Unable to apply patch {patch_path}")
+
 # ----------------------------------------------------------
 # SHARED
 # ----------------------------------------------------------
@@ -162,7 +175,14 @@ def patch_ldid_padding_assertion():
 
     path.write_bytes(data.replace(old, new, 1))
 
+def patch_altsign_developer_override():
+    apply_git_patch_once(
+        "Dependencies/AltSign",
+        "scripts/ci/patches/altsign-developer-entitlements.patch"
+    )
+
 def build():
+    patch_altsign_developer_override()
     patch_ldid_padding_assertion()
     run("mkdir -p build/logs")
     run(
@@ -179,6 +199,7 @@ def build():
 # ----------------------------------------------------------
 
 def tests_build():
+    patch_altsign_developer_override()
     patch_ldid_padding_assertion()
     run("mkdir -p build/logs")
     run(

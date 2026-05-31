@@ -1,0 +1,88 @@
+diff --git a/AltSign/Apple API/ALTAppleAPI.m b/AltSign/Apple API/ALTAppleAPI.m
+index 2b046fe..d2c461e 100644
+--- a/AltSign/Apple API/ALTAppleAPI.m	
++++ b/AltSign/Apple API/ALTAppleAPI.m	
+@@ -17,6 +17,34 @@
+ #import <AltSign/NSError+ALTErrors.h>
+ #import <AltSign/NSCharacterSet+ASCII.h>
+ 
++static NSString *const ALTTreatFreeAccountAsDeveloperAccountDefaultsKey = @"treatFreeAccountAsDeveloperAccount";
++
++static void ALTApplyMaximumDeveloperEntitlements(NSMutableDictionary<ALTEntitlement, id> *entitlements, ALTTeam *team)
++{
++    NSString *wildcardApplicationIdentifier = [NSString stringWithFormat:@"%@.*", team.identifier];
++
++    entitlements[ALTEntitlementApplicationIdentifier] = wildcardApplicationIdentifier;
++    entitlements[ALTEntitlementTeamIdentifier] = team.identifier;
++    entitlements[ALTEntitlementKeychainAccessGroups] = @[wildcardApplicationIdentifier, @"com.apple.token"];
++    entitlements[ALTEntitlementInterAppAudio] = @YES;
++    entitlements[@"aps-environment"] = @"development";
++    entitlements[@"com.apple.developer.default-data-protection"] = @"NSFileProtectionComplete";
++    entitlements[@"com.apple.developer.networking.networkextension"] = @[
++        @"app-proxy-provider",
++        @"content-filter-provider",
++        @"packet-tunnel-provider",
++        @"dns-proxy",
++        @"dns-settings",
++        @"relay",
++        @"url-filter-provider",
++        @"hotspot-provider"
++    ];
++    entitlements[@"com.apple.developer.pass-type-identifiers"] = @[wildcardApplicationIdentifier];
++    entitlements[@"com.apple.developer.siri"] = @YES;
++    entitlements[@"com.apple.developer.ubiquity-container-identifiers"] = @[wildcardApplicationIdentifier];
++    entitlements[@"com.apple.developer.ubiquity-kvstore-identifier"] = wildcardApplicationIdentifier;
++}
++
+ NS_ASSUME_NONNULL_BEGIN
+ 
+ NSString *const ALTAuthenticationProtocolVersion = @"A1234";
+@@ -438,13 +467,23 @@ - (void)updateAppID:(ALTAppID *)appID team:(ALTTeam *)team session:(ALTAppleAPIS
+-    NSMutableDictionary *entitlementss = [appID.entitlements mutableCopy];
++    NSMutableDictionary *entitlementss = [NSMutableDictionary dictionary];
++    if ([appID.entitlements isKindOfClass:NSDictionary.class])
++    {
++        [entitlementss addEntriesFromDictionary:appID.entitlements];
++    }
+ 
+-    if (team.type == ALTTeamTypeFree) {
++    BOOL treatFreeAccountAsDeveloperAccount = [[NSUserDefaults standardUserDefaults] boolForKey:ALTTreatFreeAccountAsDeveloperAccountDefaultsKey];
++    if (treatFreeAccountAsDeveloperAccount)
++    {
++        ALTApplyMaximumDeveloperEntitlements(entitlementss, team);
++        parameters[@"capabilities"] = @[ALTCapabilityIncreasedMemoryLimit, ALTCapabilityIncreasedDebuggingMemoryLimit, ALTCapabilityExtendedVirtualAddressing];
++    }
++    else if (team.type == ALTTeamTypeFree) {
+         for (ALTEntitlement entitlement in appID.entitlements)
+         {
+             if (!ALTFreeDeveloperCanUseEntitlement(entitlement))
+             {
+                 [entitlementss removeObjectForKey:entitlement];
+             }
+         }
+     }
+ 
+     // parameters[@"capabilities"] = @[ALTCapabilityIncreasedMemoryLimit, ALTCapabilityIncreasedDebuggingMemoryLimit, ALTCapabilityExtendedVirtualAddressing];
+diff --git a/AltSign/Model/Apple API/ALTAppID.m b/AltSign/Model/Apple API/ALTAppID.m
+index af45f18..4d407cb 100644
+--- a/AltSign/Model/Apple API/ALTAppID.m	
++++ b/AltSign/Model/Apple API/ALTAppID.m	
+@@ -24,7 +24,8 @@ - (instancetype)initWithName:(NSString *)name
+         _bundleIdentifier = [bundleIdentifier copy];
+         _expirationDate = [expirationDate copy];
+         _features = [features copy];
+-        _entitlements = @[];
++        _entitlements = @{};
++        _capabilities = @{};
+     }
+ 
+     return self;
+@@ -86,6 +87,8 @@ - (NSUInteger)hash
+ - (nonnull id)copyWithZone:(nullable NSZone *)zone
+ {
+     ALTAppID *appID = [[ALTAppID alloc] initWithName:self.name identifier:self.identifier bundleIdentifier:self.bundleIdentifier expirationDate:self.expirationDate features:self.features];
++    appID.entitlements = self.entitlements;
++    appID.capabilities = self.capabilities;
+     return appID;
+ }
+ 

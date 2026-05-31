@@ -33,6 +33,7 @@ public extension UserDefaults
     @NSManaged var enableEMPforWireguard: Bool
     @NSManaged var isIdleTimeoutDisableEnabled: Bool
     @NSManaged var isAppLimitDisabled: Bool
+    @NSManaged var treatFreeAccountAsDeveloperAccount: Bool
     @NSManaged var isBetaUpdatesEnabled: Bool
     @NSManaged var customizeAppId: Bool
     @NSManaged var isExportResignedAppEnabled: Bool
@@ -128,6 +129,7 @@ public extension UserDefaults
         
         let defaults = [
             #keyPath(UserDefaults.isAppLimitDisabled): false,
+            #keyPath(UserDefaults.treatFreeAccountAsDeveloperAccount): false,
             #keyPath(UserDefaults.isBetaUpdatesEnabled): false,
             #keyPath(UserDefaults.customizeAppId): false,
             #keyPath(UserDefaults.isExportResignedAppEnabled): false,

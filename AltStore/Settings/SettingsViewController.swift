@@ -16,6 +16,7 @@ import IntentsUI
 import SemanticVersion
 import AltStoreCore
 import CAltSign
+import AltSign
 import UniformTypeIdentifiers
 
 extension SettingsViewController
@@ -88,6 +89,11 @@ extension SettingsViewController
         case importCert
         case exportCert
         case exportSigningAssets
+    }
+
+    private enum ExtraSigningSettingsRow
+    {
+        static let treatFreeAsDeveloper = SigningSettingsRow.allCases.count
     }
 
     private enum BetaTestingRow: Int, CaseIterable {
@@ -202,6 +208,23 @@ final class SettingsViewController: UITableViewController
 
         // Set initial state
         updateReleaseChannelButtonTitle()
+    }
+
+    private func makeTreatFreeAccountAsDeveloperCell() -> UITableViewCell
+    {
+        let cell = UITableViewCell(style: .default, reuseIdentifier: nil)
+        cell.backgroundColor = UIColor.white.withAlphaComponent(0.15)
+        cell.selectionStyle = .none
+        cell.textLabel?.text = NSLocalizedString("Treat Free as Developer", comment: "")
+        cell.textLabel?.textColor = .white
+        cell.textLabel?.font = UIFont.boldSystemFont(ofSize: 17)
+
+        let toggle = UISwitch()
+        toggle.isOn = UserDefaults.standard.treatFreeAccountAsDeveloperAccount
+        toggle.addTarget(self, action: #selector(SettingsViewController.toggleTreatFreeAccountAsDeveloper(_:)), for: .valueChanged)
+        cell.accessoryView = toggle
+
+        return cell
     }
 
 
@@ -397,50 +420,151 @@ final class SettingsViewController: UITableViewController
             return
         }
 
-        let provisioningProfileURL = Bundle.main.provisioningProfileURL
-        guard FileManager.default.fileExists(atPath: provisioningProfileURL.path) else {
-            let toastView = ToastView(text: NSLocalizedString("Failed to export signing files!", comment: ""), detailText: "Provisioning profile not found.")
-            toastView.show(in: self)
-            return
+        if UserDefaults.standard.treatFreeAccountAsDeveloperAccount
+        {
+            return self.exportSigningAssetsWithWildcardProfile(p12Data: p12Data)
         }
 
         do
         {
-            let fileManager = FileManager.default
-            let exportDirectoryURL = fileManager.temporaryDirectory.appendingPathComponent("SideStoreSigningFiles", isDirectory: true)
-            if fileManager.fileExists(atPath: exportDirectoryURL.path)
-            {
-                try fileManager.removeItem(at: exportDirectoryURL)
-            }
-
-            try fileManager.createDirectory(at: exportDirectoryURL, withIntermediateDirectories: true)
-
-            let p12URL = exportDirectoryURL.appendingPathComponent("SideStoreSigningCertificate.p12")
-            let exportedProvisioningProfileURL = exportDirectoryURL.appendingPathComponent("SideStore.mobileprovision")
-            let passwordInfoURL = exportDirectoryURL.appendingPathComponent("README.txt")
-
-            try p12Data.write(to: p12URL, options: .atomic)
-            try fileManager.copyItem(at: provisioningProfileURL, to: exportedProvisioningProfileURL)
-
-            let passwordInfo = """
-            SideStore signing export
-
-            SideStoreSigningCertificate.p12 password: leave blank
-            SideStore.mobileprovision password: none
-            """
-            try passwordInfo.write(to: passwordInfoURL, atomically: true, encoding: .utf8)
-
-            let exportViewController = UIDocumentPickerViewController(
-                forExporting: [p12URL, exportedProvisioningProfileURL, passwordInfoURL],
-                asCopy: true
-            )
-            self.present(exportViewController, animated: true)
+            let provisioningProfileURL = Bundle.main.provisioningProfileURL
+            let provisioningProfileData = try Data(contentsOf: provisioningProfileURL)
+            try self.presentSigningAssetsExport(p12Data: p12Data, provisioningProfileData: provisioningProfileData, profileFilename: "SideStore.mobileprovision")
         }
         catch
         {
             let toastView = ToastView(text: NSLocalizedString("Failed to export signing files!", comment: ""), detailText: error.localizedDescription)
             toastView.show(in: self)
         }
+    }
+
+    private func exportSigningAssetsWithWildcardProfile(p12Data: Data)
+    {
+        AppManager.shared.authenticate(presentingViewController: self) { result in
+            switch result
+            {
+            case .failure(let error):
+                DispatchQueue.main.async {
+                    ToastView(error: error).show(in: self)
+                }
+
+            case .success(let (team, _, session)):
+                self.fetchWildcardProvisioningProfile(team: team, session: session) { result in
+                    DispatchQueue.main.async {
+                        switch result
+                        {
+                        case .failure(let error):
+                            ToastView(error: error).show(in: self)
+
+                        case .success(let profile):
+                            do
+                            {
+                                try self.presentSigningAssetsExport(p12Data: p12Data, provisioningProfileData: profile.data, profileFilename: "SideStoreWildcard.mobileprovision")
+                            }
+                            catch
+                            {
+                                ToastView(text: NSLocalizedString("Failed to export signing files!", comment: ""), detailText: error.localizedDescription).show(in: self)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func fetchWildcardProvisioningProfile(team: ALTTeam, session: ALTAppleAPISession, completionHandler: @escaping (Result<ALTProvisioningProfile, Error>) -> Void)
+    {
+        func updateAndFetch(_ appID: ALTAppID)
+        {
+            let wildcardAppID = appID.copy() as! ALTAppID
+            wildcardAppID.entitlements = [:]
+
+            ALTAppleAPI.shared.update(wildcardAppID, team: team, session: session) { updatedAppID, error in
+                if let error
+                {
+                    return completionHandler(.failure(error))
+                }
+
+                guard let updatedAppID = updatedAppID else {
+                    return completionHandler(.failure(ALTError(.unknown)))
+                }
+
+                ALTAppleAPI.shared.fetchProvisioningProfile(for: updatedAppID, deviceType: .iphone, team: team, session: session) { profile, error in
+                    if let error
+                    {
+                        return completionHandler(.failure(error))
+                    }
+
+                    guard let profile else {
+                        return completionHandler(.failure(ALTError(.unknown)))
+                    }
+
+                    completionHandler(.success(profile))
+                }
+            }
+        }
+
+        ALTAppleAPI.shared.fetchAppIDs(for: team, session: session) { appIDs, error in
+            if let error
+            {
+                return completionHandler(.failure(error))
+            }
+
+            guard let appIDs else {
+                return completionHandler(.failure(ALTError(.unknown)))
+            }
+
+            if let wildcardAppID = appIDs.first(where: { $0.bundleIdentifier == "*" })
+            {
+                return updateAndFetch(wildcardAppID)
+            }
+
+            ALTAppleAPI.shared.addAppID(withName: "SideStore Wildcard", bundleIdentifier: "*", team: team, session: session) { appID, error in
+                if let error
+                {
+                    return completionHandler(.failure(error))
+                }
+
+                guard let appID else {
+                    return completionHandler(.failure(ALTError(.unknown)))
+                }
+
+                updateAndFetch(appID)
+            }
+        }
+    }
+
+    private func presentSigningAssetsExport(p12Data: Data, provisioningProfileData: Data, profileFilename: String) throws
+    {
+        let fileManager = FileManager.default
+        let exportDirectoryURL = fileManager.temporaryDirectory.appendingPathComponent("SideStoreSigningFiles", isDirectory: true)
+        if fileManager.fileExists(atPath: exportDirectoryURL.path)
+        {
+            try fileManager.removeItem(at: exportDirectoryURL)
+        }
+
+        try fileManager.createDirectory(at: exportDirectoryURL, withIntermediateDirectories: true)
+
+        let p12URL = exportDirectoryURL.appendingPathComponent("SideStoreSigningCertificate.p12")
+        let exportedProvisioningProfileURL = exportDirectoryURL.appendingPathComponent(profileFilename)
+        let passwordInfoURL = exportDirectoryURL.appendingPathComponent("README.txt")
+
+        try p12Data.write(to: p12URL, options: .atomic)
+        try provisioningProfileData.write(to: exportedProvisioningProfileURL, options: .atomic)
+
+        let passwordInfo = """
+        SideStore signing export
+
+        SideStoreSigningCertificate.p12 password: leave blank
+        \(profileFilename) password: none
+        """
+        try passwordInfo.write(to: passwordInfoURL, atomically: true, encoding: .utf8)
+
+        let exportViewController = UIDocumentPickerViewController(
+            forExporting: [p12URL, exportedProvisioningProfileURL, passwordInfoURL],
+            asCopy: true
+        )
+        self.present(exportViewController, animated: true)
     }
 
     override func viewWillAppear(_ animated: Bool)
@@ -769,6 +893,17 @@ private extension SettingsViewController
             UserDefaults.standard.activeAppsLimit = nil
         }
     }
+
+    @objc func toggleTreatFreeAccountAsDeveloper(_ sender: UISwitch)
+    {
+        UserDefaults.standard.treatFreeAccountAsDeveloperAccount = sender.isOn
+        UserDefaults.shared.treatFreeAccountAsDeveloperAccount = sender.isOn
+
+        if sender.isOn
+        {
+            UserDefaults.standard.activeAppsLimit = nil
+        }
+    }
     
     @IBAction func toggleResignedAppExport(_ sender: UISwitch) {
         // update it in database
@@ -1070,12 +1205,19 @@ extension SettingsViewController
         case .signIn: return (self.activeTeam == nil) ? 1 : 0
         case .account: return (self.activeTeam == nil) ? 0 : 3
         case .appRefresh: return AppRefreshRow.allCases.count
+        case .signing: return super.tableView(tableView, numberOfRowsInSection: section.rawValue) + 1
         default: return super.tableView(tableView, numberOfRowsInSection: section.rawValue)
         }
     }
     
     override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell
     {
+        let section = Section.allCases[indexPath.section]
+        if section == .signing, indexPath.row == ExtraSigningSettingsRow.treatFreeAsDeveloper
+        {
+            return self.makeTreatFreeAccountAsDeveloperCell()
+        }
+
         let cell = super.tableView(tableView, cellForRowAt: indexPath)
         
         if #available(iOS 14, *) {}
@@ -1443,6 +1585,18 @@ extension SettingsViewController
             case .refreshAttempts, .enableEMPForWiregaurd, .customizeAppId: break
             }
         case .signing:
+            if indexPath.row == ExtraSigningSettingsRow.treatFreeAsDeveloper
+            {
+                UserDefaults.standard.treatFreeAccountAsDeveloperAccount.toggle()
+                UserDefaults.shared.treatFreeAccountAsDeveloperAccount = UserDefaults.standard.treatFreeAccountAsDeveloperAccount
+                if UserDefaults.standard.treatFreeAccountAsDeveloperAccount
+                {
+                    UserDefaults.standard.activeAppsLimit = nil
+                }
+                tableView.reloadRows(at: [indexPath], with: .automatic)
+                return
+            }
+
             let row = SigningSettingsRow.allCases[indexPath.row]
             switch row {
             case .exportAccount: showExportAccount()
