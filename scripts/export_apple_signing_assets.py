@@ -69,7 +69,7 @@ DEFAULT_BUNDLE_IDENTIFIER = "*"
 DEFAULT_APP_ID_NAME = "SideStore Wildcard"
 DEFAULT_MACHINE_NAME = "SideStore Windows Export"
 PRIMARY_P12_FILENAME = "Certificate.p12"
-P12_ALIAS_FILENAMES = ["SideStoreSigningCertificate.p12"]
+P12_INPUT_FILENAMES = [PRIMARY_P12_FILENAME, "SideStoreSigningCertificate.p12"]
 SERVICES_BASE_URL = "https://developerservices2.apple.com/services/v1/"
 DEFAULT_CERTIFICATE_TYPE = "auto"
 CERTIFICATE_CONFIGS = {
@@ -102,21 +102,18 @@ PROFILE_PLATFORM_CONFIGS = {
     "ios": {
         "display_name": "iOS/iPadOS",
         "filename": "Wildcard.mobileprovision",
-        "alias_filenames": ["SideStoreWildcard.mobileprovision", "SideStoreWildcard-iOS.mobileprovision"],
         "device_classes": {"iphone", "ipad", "ipod", "ipodtouch"},
         "parameter_attempts": [{"DTDK_Platform": "ios"}],
     },
     "tvos": {
         "display_name": "tvOS",
         "filename": "Wildcard-tvOS.mobileprovision",
-        "alias_filenames": ["SideStoreWildcard-tvOS.mobileprovision"],
         "device_classes": {"tvos", "appletv", "appletvdevice"},
         "parameter_attempts": [{"DTDK_Platform": "tvos", "subPlatform": "tvOS"}],
     },
     "visionos": {
         "display_name": "visionOS",
         "filename": "Wildcard-visionOS.mobileprovision",
-        "alias_filenames": ["SideStoreWildcard-visionOS.mobileprovision"],
         "device_classes": {"vision", "visionos", "xros", "realitydevice"},
         "parameter_attempts": [
             {"DTDK_Platform": "xros", "subPlatform": "xrOS"},
@@ -124,7 +121,7 @@ PROFILE_PLATFORM_CONFIGS = {
         ],
     },
 }
-DEFAULT_PROFILE_PLATFORMS = "auto"
+DEFAULT_PROFILE_PLATFORMS = "ios"
 PROFILE_PLATFORM_ALIASES = {
     "ipados": "ios",
     "xros": "visionos",
@@ -163,6 +160,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--skip-max-entitlements",
         action="store_true",
         help="Do not ask Apple to update the wildcard App ID with maximum entitlements before downloading the profile.",
+    )
+    parser.add_argument(
+        "--replace-existing-wildcard-app-id",
+        action="store_true",
+        help=(
+            "Delete the existing '*' App ID if it is not named --app-id-name, then create a new preferred wildcard App ID. "
+            "This can invalidate profiles that used the old wildcard App ID."
+        ),
     )
     parser.add_argument(
         "--allow-revoke-existing-certificate",
@@ -563,9 +568,8 @@ def serialize_private_key_pem(private_key) -> bytes:
 
 
 def p12_candidate_paths(output_dir: Path) -> list[Path]:
-    names = [PRIMARY_P12_FILENAME, *P12_ALIAS_FILENAMES]
     paths: list[Path] = []
-    for name in names:
+    for name in P12_INPUT_FILENAMES:
         path = output_dir / name
         if path not in paths:
             paths.append(path)
@@ -894,13 +898,39 @@ def fetch_app_ids(client: AppleDeveloperClient, team_id: str, session) -> list[d
     return [app_id for app_id in app_ids if isinstance(app_id, dict)]
 
 
-def find_or_create_app_id(client: AppleDeveloperClient, team_id: str, session, bundle_id: str, name: str) -> dict[str, Any]:
+def delete_app_id(client: AppleDeveloperClient, team_id: str, session, app_id: dict[str, Any]) -> None:
+    app_id_id = require_field(app_id, "appIdId", str, "Apple App ID")
+    print(f"Deleting existing App ID: {app_id_name(app_id)} ({app_id.get('identifier')})")
+    client._send_developer_request(
+        "ios/deleteAppId.action",
+        team_id=team_id,
+        session=session,
+        additional_parameters={"appIdId": app_id_id},
+    )
+
+
+def find_or_create_app_id(
+    client: AppleDeveloperClient,
+    team_id: str,
+    session,
+    bundle_id: str,
+    name: str,
+    *,
+    replace_existing_wildcard_app_id: bool,
+) -> dict[str, Any]:
     app_ids = fetch_app_ids(client, team_id, session)
     matching_app_ids = [app_id for app_id in app_ids if app_id_matches_bundle(app_id, bundle_id)]
     for app_id in matching_app_ids:
         if app_id_matches_name(app_id, name):
             print(f"Using existing preferred App ID: {app_id_name(app_id)} ({bundle_id})")
             return app_id
+
+    if replace_existing_wildcard_app_id:
+        if bundle_id != "*":
+            raise FlowError("--replace-existing-wildcard-app-id can only be used with --bundle-id '*'.")
+        for app_id in matching_app_ids:
+            delete_app_id(client, team_id, session, app_id)
+        matching_app_ids = []
 
     if matching_app_ids:
         existing_names = ", ".join(app_id_name(app_id) or "(unnamed)" for app_id in matching_app_ids)
@@ -1204,13 +1234,6 @@ def profile_filename(profile_platform: str) -> str:
     return str(PROFILE_PLATFORM_CONFIGS[profile_platform]["filename"])
 
 
-def profile_alias_filenames(profile_platform: str) -> list[str]:
-    alias_filenames = PROFILE_PLATFORM_CONFIGS[profile_platform].get("alias_filenames")
-    if not isinstance(alias_filenames, list):
-        return []
-    return [str(filename) for filename in alias_filenames if isinstance(filename, str) and filename]
-
-
 def download_provisioning_profile(
     client: AppleDeveloperClient,
     team_id: str,
@@ -1368,49 +1391,30 @@ def write_outputs(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     p12_path = output_dir / PRIMARY_P12_FILENAME
-    readme_path = output_dir / "README.txt"
 
     if not profile_exports:
         raise FlowError("No provisioning profiles were exported.")
 
+    profile_paths = [output_dir / profile_filename(profile_platform) for profile_platform, _profile_data, _profile in profile_exports]
+    current_outputs = {p12_path, *profile_paths}
+    stale_generated_filenames = {
+        "README.txt",
+        "SideStoreSigningCertificate.p12",
+        "SideStoreWildcard.mobileprovision",
+        "SideStoreWildcard-iOS.mobileprovision",
+        "SideStoreWildcard-tvOS.mobileprovision",
+        "SideStoreWildcard-visionOS.mobileprovision",
+        "Wildcard-tvOS.mobileprovision",
+        "Wildcard-visionOS.mobileprovision",
+    }
+    for filename in stale_generated_filenames:
+        stale_path = output_dir / filename
+        if stale_path not in current_outputs and stale_path.exists():
+            stale_path.unlink()
+
     p12_path.write_bytes(p12_data)
-    p12_paths = [p12_path]
-    for alias_filename in P12_ALIAS_FILENAMES:
-        alias_path = output_dir / alias_filename
-        alias_path.write_bytes(p12_data)
-        if alias_path not in p12_paths:
-            p12_paths.append(alias_path)
-
-    profile_paths: list[Path] = []
-    for profile_platform, profile_data, _profile in profile_exports:
-        path = output_dir / profile_filename(profile_platform)
+    for path, (_profile_platform, profile_data, _profile) in zip(profile_paths, profile_exports):
         path.write_bytes(profile_data)
-        profile_paths.append(path)
-
-        for alias_filename in profile_alias_filenames(profile_platform):
-            alias_path = output_dir / alias_filename
-            alias_path.write_bytes(profile_data)
-            if alias_path not in profile_paths:
-                profile_paths.append(alias_path)
-
-    p12_notes = [
-        f"{path.name} password: {'provided by --p12-password' if p12_password else 'leave blank'}"
-        for path in p12_paths
-    ]
-    profile_notes = [f"{path.name} password: none" for path in profile_paths]
-    readme_path.write_text(
-        "\n".join(
-            [
-                "SideStore signing export",
-                "",
-                f"Generated at: {dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}",
-                *p12_notes,
-                *profile_notes,
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
 
     if save_pem:
         (output_dir / "certificate.pem").write_bytes(certificate_pem)
@@ -1418,11 +1422,9 @@ def write_outputs(
 
     print()
     print("Exported signing assets:")
-    for current_p12_path in p12_paths:
-        print(f"  P12: {current_p12_path}")
+    print(f"  P12: {p12_path}")
     for profile_path in profile_paths:
         print(f"  Profile: {profile_path}")
-    print(f"  Notes: {readme_path}")
     if save_pem:
         print(f"  Certificate PEM: {output_dir / 'certificate.pem'}")
         print(f"  Private key PEM: {output_dir / 'private_key.pem'}")
@@ -1467,7 +1469,14 @@ def main() -> int:
     if args.udid:
         ensure_device_registered(client, team_id, session, args.udid, args.device_name)
 
-    app_id = find_or_create_app_id(client, team_id, session, args.bundle_id, args.app_id_name)
+    app_id = find_or_create_app_id(
+        client,
+        team_id,
+        session,
+        args.bundle_id,
+        args.app_id_name,
+        replace_existing_wildcard_app_id=args.replace_existing_wildcard_app_id,
+    )
     if not args.skip_max_entitlements:
         app_id = update_app_id_for_maximum_entitlements(client, team_id, session, app_id, selected_certificate_type)
 
