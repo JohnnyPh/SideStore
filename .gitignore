@@ -73,3 +73,11 @@ local-build.sh
 
 source-metadata.json
 release-notes.md
+
+# Local signing exports and secrets
+/scripts/signing-export/
+/signing-export/
+*.p12
+*.mobileprovision
+*.cer
+*.pem
