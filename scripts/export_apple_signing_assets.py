@@ -2,10 +2,9 @@
 """
 Export Apple signing assets from Windows.
 
-This creates a fresh local private key and CSR, submits only the CSR to Apple,
-downloads a wildcard provisioning profile, and writes the resulting .p12 and
-.mobileprovision files locally. The private key is never sent to Apple or to an
-anisette server.
+This creates or reuses a local private key and certificate, downloads wildcard
+provisioning profiles, and writes the resulting .p12 and .mobileprovision files
+locally. The private key is never sent to Apple or to an anisette server.
 """
 
 from __future__ import annotations
@@ -69,6 +68,8 @@ DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "signing-export"
 DEFAULT_BUNDLE_IDENTIFIER = "*"
 DEFAULT_APP_ID_NAME = "SideStore Wildcard"
 DEFAULT_MACHINE_NAME = "SideStore Windows Export"
+PRIMARY_P12_FILENAME = "Certificate.p12"
+P12_ALIAS_FILENAMES = ["SideStoreSigningCertificate.p12"]
 SERVICES_BASE_URL = "https://developerservices2.apple.com/services/v1/"
 DEFAULT_CERTIFICATE_TYPE = "auto"
 CERTIFICATE_CONFIGS = {
@@ -100,20 +101,22 @@ NETWORK_EXTENSION_PROVIDERS = [
 PROFILE_PLATFORM_CONFIGS = {
     "ios": {
         "display_name": "iOS/iPadOS",
-        "filename": "SideStoreWildcard-iOS.mobileprovision",
-        "legacy_filename": "SideStoreWildcard.mobileprovision",
+        "filename": "Wildcard.mobileprovision",
+        "alias_filenames": ["SideStoreWildcard.mobileprovision", "SideStoreWildcard-iOS.mobileprovision"],
         "device_classes": {"iphone", "ipad", "ipod", "ipodtouch"},
         "parameter_attempts": [{"DTDK_Platform": "ios"}],
     },
     "tvos": {
         "display_name": "tvOS",
-        "filename": "SideStoreWildcard-tvOS.mobileprovision",
+        "filename": "Wildcard-tvOS.mobileprovision",
+        "alias_filenames": ["SideStoreWildcard-tvOS.mobileprovision"],
         "device_classes": {"tvos", "appletv", "appletvdevice"},
         "parameter_attempts": [{"DTDK_Platform": "tvos", "subPlatform": "tvOS"}],
     },
     "visionos": {
         "display_name": "visionOS",
-        "filename": "SideStoreWildcard-visionOS.mobileprovision",
+        "filename": "Wildcard-visionOS.mobileprovision",
+        "alias_filenames": ["SideStoreWildcard-visionOS.mobileprovision"],
         "device_classes": {"vision", "visionos", "xros", "realitydevice"},
         "parameter_attempts": [
             {"DTDK_Platform": "xros", "subPlatform": "xrOS"},
@@ -135,7 +138,7 @@ MAXIMUM_CAPABILITIES = [
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Create and export a fresh Apple signing .p12 plus provisioning profile."
+        description="Create or reuse Apple signing assets and export a .p12 plus provisioning profiles."
     )
     parser.add_argument("--apple-id", help="Apple ID email.")
     parser.add_argument("--password-env", help="Read Apple ID password from this environment variable.")
@@ -165,6 +168,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--allow-revoke-existing-certificate",
         action="store_true",
         help="If Apple refuses a new certificate because one already exists, revoke matching existing certificates and retry.",
+    )
+    parser.add_argument(
+        "--force-new-certificate",
+        action="store_true",
+        help="Ignore a reusable local P12 in --output-dir and create a new Apple certificate.",
     )
     parser.add_argument("--p12-password", default="", help="Password for the exported .p12. Default: blank.")
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="Directory for exported signing files.")
@@ -512,6 +520,117 @@ def certificate_display_name(certificate: dict[str, Any], certificate_type: str)
     return ", ".join(parts)
 
 
+def normalized_serial_number(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    text = text[2:] if text.startswith("0X") else text
+    text = re.sub(r"[^0-9A-F]", "", text)
+    return text.lstrip("0") or "0"
+
+
+def certificate_serial_number(certificate: x509.Certificate) -> str:
+    return normalized_serial_number(format(certificate.serial_number, "X"))
+
+
+def certificate_record_serial_number(certificate: dict[str, Any]) -> str | None:
+    attributes = certificate.get("attributes")
+    if not isinstance(attributes, dict):
+        attributes = certificate
+
+    for key in ("serialNumber", "serialNum"):
+        value = attributes.get(key)
+        if value:
+            return normalized_serial_number(value)
+
+    try:
+        return certificate_serial_number(load_certificate(certificate_bytes_from_response(certificate)))
+    except (FlowError, ValueError):
+        return None
+
+
+def certificate_expires_at(certificate: x509.Certificate) -> dt.datetime:
+    expires_at = getattr(certificate, "not_valid_after_utc", None)
+    if isinstance(expires_at, dt.datetime):
+        return expires_at
+    return certificate.not_valid_after.replace(tzinfo=dt.timezone.utc)
+
+
+def serialize_private_key_pem(private_key) -> bytes:
+    return private_key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.NoEncryption(),
+    )
+
+
+def p12_candidate_paths(output_dir: Path) -> list[Path]:
+    names = [PRIMARY_P12_FILENAME, *P12_ALIAS_FILENAMES]
+    paths: list[Path] = []
+    for name in names:
+        path = output_dir / name
+        if path not in paths:
+            paths.append(path)
+    return paths
+
+
+def load_reusable_p12(output_dir: Path, password: str) -> tuple[Path, Any, bytes, x509.Certificate] | None:
+    candidate_passwords: list[bytes | None]
+    if password:
+        candidate_passwords = [password.encode("utf-8")]
+    else:
+        candidate_passwords = [None, b""]
+
+    for path in p12_candidate_paths(output_dir):
+        if not path.exists():
+            continue
+
+        p12_data = path.read_bytes()
+        last_error: Exception | None = None
+        for candidate_password in candidate_passwords:
+            try:
+                private_key, certificate, _additional_certificates = pkcs12.load_key_and_certificates(
+                    p12_data,
+                    candidate_password,
+                )
+            except (TypeError, ValueError) as exc:
+                last_error = exc
+                continue
+
+            if private_key is None or certificate is None:
+                last_error = FlowError(f"{path.name} does not contain both a private key and certificate.")
+                continue
+
+            private_key_pem = serialize_private_key_pem(private_key)
+            return path, private_key, private_key_pem, certificate
+
+        if last_error is not None:
+            print(f"Could not reuse {path.name}: {last_error}")
+
+    return None
+
+
+def find_matching_certificate_record(
+    client: AppleDeveloperClient,
+    team_id: str,
+    session,
+    certificate: x509.Certificate,
+    requested_certificate_type: str,
+) -> tuple[str, dict[str, Any]] | None:
+    serial_number = certificate_serial_number(certificate)
+    for certificate_type in certificate_type_attempts(requested_certificate_type):
+        try:
+            certificates = fetch_certificates(client, team_id, session, certificate_type)
+        except AppleDeveloperServiceError as exc:
+            if certificate_type == "distribution" and exc.result_code == 4100 and requested_certificate_type == "auto":
+                continue
+            raise
+
+        for certificate_record in certificates:
+            if certificate_record_serial_number(certificate_record) == serial_number:
+                return certificate_type, certificate_record
+
+    return None
+
+
 def revoke_certificate(client: AppleDeveloperClient, team_id: str, session, certificate: dict[str, Any], certificate_type: str) -> None:
     certificate_id = require_field(certificate, "id", str, f"Apple {certificate_display_type(certificate_type)} certificate")
     print(f"Revoking existing certificate: {certificate_display_name(certificate, certificate_type)}")
@@ -649,6 +768,71 @@ def create_best_available_certificate(
     raise distribution_not_eligible_error()
 
 
+def get_or_create_signing_certificate(
+    client: AppleDeveloperClient,
+    team_id: str,
+    session,
+    output_dir: Path,
+    machine_name: str,
+    requested_certificate_type: str,
+    *,
+    p12_password: str,
+    force_new_certificate: bool,
+    allow_revoke_existing_certificate: bool,
+):
+    if not force_new_certificate:
+        reusable = load_reusable_p12(output_dir, p12_password)
+        if reusable is not None:
+            p12_path, private_key, private_key_pem, certificate = reusable
+            expires_at = certificate_expires_at(certificate)
+            if expires_at <= dt.datetime.now(dt.timezone.utc):
+                print(f"Local P12 certificate is expired, so it cannot be reused: {p12_path}")
+            else:
+                match = find_matching_certificate_record(
+                    client,
+                    team_id,
+                    session,
+                    certificate,
+                    requested_certificate_type,
+                )
+                if match is not None:
+                    certificate_type, certificate_record = match
+                    certificate_id = require_field(
+                        certificate_record,
+                        "id",
+                        str,
+                        f"Apple {certificate_display_type(certificate_type)} certificate",
+                    )
+                    print()
+                    print(
+                        "Reusing local signing certificate: "
+                        f"{p12_path.name}, serial {certificate_serial_number(certificate)}, "
+                        f"expires {expires_at.date().isoformat()}"
+                    )
+                    return (
+                        certificate_type,
+                        private_key,
+                        private_key_pem,
+                        certificate,
+                        certificate.public_bytes(serialization.Encoding.DER),
+                        {"id": certificate_id, "certificateId": certificate_id},
+                    )
+
+                print(
+                    "Local P12 exists but Apple no longer lists its certificate for this team, "
+                    "so it cannot be used to create a matching provisioning profile."
+                )
+
+    return create_best_available_certificate(
+        client,
+        team_id,
+        session,
+        machine_name,
+        requested_certificate_type,
+        allow_revoke_existing_certificate=allow_revoke_existing_certificate,
+    )
+
+
 def create_certificate(client: AppleDeveloperClient, team_id: str, session, machine_name: str, certificate_type: str):
     private_key, csr_pem, private_key_pem = generate_certificate_request()
     response = client._send_developer_request(
@@ -690,6 +874,18 @@ def sanitized_app_id_name(name: str) -> str:
     return sanitized or "App"
 
 
+def app_id_name(app_id: dict[str, Any]) -> str:
+    return str(app_id.get("name") or app_id.get("appIdName") or "").strip()
+
+
+def app_id_matches_bundle(app_id: dict[str, Any], bundle_id: str) -> bool:
+    return str(app_id.get("identifier", "")).lower() == bundle_id.lower()
+
+
+def app_id_matches_name(app_id: dict[str, Any], name: str) -> bool:
+    return app_id_name(app_id).lower() == sanitized_app_id_name(name).lower()
+
+
 def fetch_app_ids(client: AppleDeveloperClient, team_id: str, session) -> list[dict[str, Any]]:
     response = client._send_developer_request("ios/listAppIds.action", team_id=team_id, session=session)
     app_ids = response.get("appIds")
@@ -700,12 +896,21 @@ def fetch_app_ids(client: AppleDeveloperClient, team_id: str, session) -> list[d
 
 def find_or_create_app_id(client: AppleDeveloperClient, team_id: str, session, bundle_id: str, name: str) -> dict[str, Any]:
     app_ids = fetch_app_ids(client, team_id, session)
-    for app_id in app_ids:
-        if str(app_id.get("identifier", "")).lower() == bundle_id.lower():
-            print(f"Using existing App ID: {app_id.get('name')} ({bundle_id})")
+    matching_app_ids = [app_id for app_id in app_ids if app_id_matches_bundle(app_id, bundle_id)]
+    for app_id in matching_app_ids:
+        if app_id_matches_name(app_id, name):
+            print(f"Using existing preferred App ID: {app_id_name(app_id)} ({bundle_id})")
             return app_id
 
-    print(f"Creating App ID: {bundle_id}")
+    if matching_app_ids:
+        existing_names = ", ".join(app_id_name(app_id) or "(unnamed)" for app_id in matching_app_ids)
+        print(
+            f"Existing App ID(s) already use {bundle_id}: {existing_names}. "
+            f"Asking Apple to create preferred App ID: {sanitized_app_id_name(name)}."
+        )
+    else:
+        print(f"Creating App ID: {bundle_id}")
+
     try:
         response = client._send_developer_request(
             "ios/addAppId.action",
@@ -717,10 +922,17 @@ def find_or_create_app_id(client: AppleDeveloperClient, team_id: str, session, b
             },
         )
     except AppleDeveloperServiceError as exc:
+        if exc.result_code in {9400, 9401} and matching_app_ids:
+            fallback = matching_app_ids[0]
+            print(
+                "Apple did not allow a second App ID with that bundle identifier; "
+                f"using existing App ID: {app_id_name(fallback)} ({bundle_id})"
+            )
+            return fallback
         if exc.result_code == 9401:
             for app_id in fetch_app_ids(client, team_id, session):
-                if str(app_id.get("identifier", "")).lower() == bundle_id.lower():
-                    print(f"Apple reported the App ID already exists; using: {bundle_id}")
+                if app_id_matches_bundle(app_id, bundle_id):
+                    print(f"Apple reported the App ID already exists; using: {app_id_name(app_id)} ({bundle_id})")
                     return app_id
         raise
 
@@ -992,11 +1204,11 @@ def profile_filename(profile_platform: str) -> str:
     return str(PROFILE_PLATFORM_CONFIGS[profile_platform]["filename"])
 
 
-def legacy_profile_filename(profile_platform: str) -> str | None:
-    legacy_filename = PROFILE_PLATFORM_CONFIGS[profile_platform].get("legacy_filename")
-    if isinstance(legacy_filename, str) and legacy_filename:
-        return legacy_filename
-    return None
+def profile_alias_filenames(profile_platform: str) -> list[str]:
+    alias_filenames = PROFILE_PLATFORM_CONFIGS[profile_platform].get("alias_filenames")
+    if not isinstance(alias_filenames, list):
+        return []
+    return [str(filename) for filename in alias_filenames if isinstance(filename, str) and filename]
 
 
 def download_provisioning_profile(
@@ -1061,29 +1273,50 @@ def create_limited_provisioning_profile(
     display_certificate_type = certificate_display_type(certificate_type)
     platform_name = profile_platform_display_name(profile_platform)
     print(f"Creating wildcard limited {display_certificate_type} {platform_name} profile for {len(device_ids)} registered device(s)...")
+    timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d%H%M%S")
+    safe_platform_name = platform_name.replace("/", "-")
+    certificate_suffix = re.sub(r"[^A-Za-z0-9]", "", certificate_id)[:8] or "cert"
+    profile_names = [
+        f"SideStore Wildcard {platform_name} {display_certificate_type}",
+        f"SideStore Wildcard {safe_platform_name} {display_certificate_type} {certificate_suffix} {timestamp}",
+    ]
     last_error: Exception | None = None
-    for parameters in profile_platform_parameter_attempts(profile_platform):
-        try:
-            response = client._send_developer_request(
-                "ios/createProvisioningProfile.action",
-                team_id=team_id,
-                session=session,
-                additional_parameters={
-                    "provisioningProfileName": f"SideStore Wildcard {platform_name} {display_certificate_type}",
-                    "appIdId": app_id_id,
-                    "certificateIds": [certificate_id],
-                    "deviceIds": device_ids,
-                    "distributionType": "limited",
-                    **parameters,
-                },
-            )
+    response: dict[str, Any] | None = None
+    for profile_name in profile_names:
+        for parameters in profile_platform_parameter_attempts(profile_platform):
+            try:
+                response = client._send_developer_request(
+                    "ios/createProvisioningProfile.action",
+                    team_id=team_id,
+                    session=session,
+                    additional_parameters={
+                        "provisioningProfileName": profile_name,
+                        "appIdId": app_id_id,
+                        "certificateIds": [certificate_id],
+                        "deviceIds": device_ids,
+                        "distributionType": "limited",
+                        **parameters,
+                    },
+                )
+                break
+            except AppleDeveloperServiceError as exc:
+                last_error = exc
+                if exc.result_code == 35 and profile_name == profile_names[0]:
+                    print("Apple found duplicate profile names; retrying with a unique profile name.")
+                    break
+            except FlowError as exc:
+                last_error = exc
+        if response is not None:
             break
-        except (AppleDeveloperServiceError, FlowError) as exc:
-            last_error = exc
     else:
         if last_error is not None:
             raise last_error
         raise FlowError(f"No platform parameters are configured for {platform_name}.")
+
+    if response is None:
+        if last_error is not None:
+            raise last_error
+        raise FlowError(f"Apple did not create a {platform_name} provisioning profile.")
 
     try:
         return profile_data_from_response(response)
@@ -1134,26 +1367,36 @@ def write_outputs(
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    p12_path = output_dir / "SideStoreSigningCertificate.p12"
+    p12_path = output_dir / PRIMARY_P12_FILENAME
     readme_path = output_dir / "README.txt"
 
     if not profile_exports:
         raise FlowError("No provisioning profiles were exported.")
 
     p12_path.write_bytes(p12_data)
+    p12_paths = [p12_path]
+    for alias_filename in P12_ALIAS_FILENAMES:
+        alias_path = output_dir / alias_filename
+        alias_path.write_bytes(p12_data)
+        if alias_path not in p12_paths:
+            p12_paths.append(alias_path)
+
     profile_paths: list[Path] = []
     for profile_platform, profile_data, _profile in profile_exports:
         path = output_dir / profile_filename(profile_platform)
         path.write_bytes(profile_data)
         profile_paths.append(path)
 
-        legacy_filename = legacy_profile_filename(profile_platform)
-        if legacy_filename is not None:
-            legacy_path = output_dir / legacy_filename
-            legacy_path.write_bytes(profile_data)
-            if legacy_path not in profile_paths:
-                profile_paths.append(legacy_path)
+        for alias_filename in profile_alias_filenames(profile_platform):
+            alias_path = output_dir / alias_filename
+            alias_path.write_bytes(profile_data)
+            if alias_path not in profile_paths:
+                profile_paths.append(alias_path)
 
+    p12_notes = [
+        f"{path.name} password: {'provided by --p12-password' if p12_password else 'leave blank'}"
+        for path in p12_paths
+    ]
     profile_notes = [f"{path.name} password: none" for path in profile_paths]
     readme_path.write_text(
         "\n".join(
@@ -1161,7 +1404,7 @@ def write_outputs(
                 "SideStore signing export",
                 "",
                 f"Generated at: {dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}",
-                f"SideStoreSigningCertificate.p12 password: {'provided by --p12-password' if p12_password else 'leave blank'}",
+                *p12_notes,
                 *profile_notes,
                 "",
             ]
@@ -1175,7 +1418,8 @@ def write_outputs(
 
     print()
     print("Exported signing assets:")
-    print(f"  P12: {p12_path}")
+    for current_p12_path in p12_paths:
+        print(f"  P12: {current_p12_path}")
     for profile_path in profile_paths:
         print(f"  Profile: {profile_path}")
     print(f"  Notes: {readme_path}")
@@ -1214,6 +1458,7 @@ def main() -> int:
 
     args = parser.parse_args()
     validate_arguments(args, parser)
+    output_dir = Path(args.output_dir)
 
     client, session, team = authenticate(args, parser)
     team_id = require_field(team, "teamId", str, "Apple team selection")
@@ -1237,12 +1482,15 @@ def main() -> int:
         certificate,
         certificate_data,
         certificate_response,
-    ) = create_best_available_certificate(
+    ) = get_or_create_signing_certificate(
         client,
         team_id,
         session,
+        output_dir,
         args.machine_name,
         requested_certificate_type,
+        p12_password=args.p12_password,
+        force_new_certificate=args.force_new_certificate,
         allow_revoke_existing_certificate=args.allow_revoke_existing_certificate,
     )
     serial_number = format(certificate.serial_number, "X").lstrip("0")
@@ -1290,7 +1538,7 @@ def main() -> int:
 
     p12_data = serialize_p12(private_key, certificate, args.p12_password)
     write_outputs(
-        Path(args.output_dir),
+        output_dir,
         p12_data,
         profile_exports,
         certificate.public_bytes(serialization.Encoding.PEM),
