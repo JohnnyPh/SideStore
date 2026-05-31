@@ -89,11 +89,7 @@ extension SettingsViewController
         case importCert
         case exportCert
         case exportSigningAssets
-    }
-
-    private enum ExtraSigningSettingsRow
-    {
-        static let treatFreeAsDeveloper = SigningSettingsRow.allCases.count
+        case treatFreeAsDeveloper
     }
 
     private enum BetaTestingRow: Int, CaseIterable {
@@ -137,6 +133,7 @@ final class SettingsViewController: UITableViewController
     @IBOutlet private var disableAppLimitSwitch: UISwitch!
     @IBOutlet private var betaUpdatesSwitch: UISwitch!
     @IBOutlet private var customizeAppIdSwitch: UISwitch!
+    @IBOutlet private var treatFreeAccountAsDeveloperSwitch: UISwitch!
     @IBOutlet private var exportResignedAppsSwitch: UISwitch!
     @IBOutlet private var verboseOperationsLoggingSwitch: UISwitch!
     @IBOutlet private var minimuxerConsoleLoggingSwitch: UISwitch!
@@ -209,24 +206,6 @@ final class SettingsViewController: UITableViewController
         // Set initial state
         updateReleaseChannelButtonTitle()
     }
-
-    private func makeTreatFreeAccountAsDeveloperCell() -> UITableViewCell
-    {
-        let cell = UITableViewCell(style: .default, reuseIdentifier: nil)
-        cell.backgroundColor = UIColor.white.withAlphaComponent(0.15)
-        cell.selectionStyle = .none
-        cell.textLabel?.text = NSLocalizedString("Treat Free as Developer", comment: "")
-        cell.textLabel?.textColor = .white
-        cell.textLabel?.font = UIFont.boldSystemFont(ofSize: 17)
-
-        let toggle = UISwitch()
-        toggle.isOn = UserDefaults.standard.treatFreeAccountAsDeveloperAccount
-        toggle.addTarget(self, action: #selector(SettingsViewController.toggleTreatFreeAccountAsDeveloper(_:)), for: .valueChanged)
-        cell.accessoryView = toggle
-
-        return cell
-    }
-
 
     override func viewDidLoad()
     {
@@ -670,6 +649,9 @@ private extension SettingsViewController
 
         // AdvancedSettingsRow
         self.customizeAppIdSwitch.isOn = UserDefaults.standard.customizeAppId
+
+        // SigningSettingsRow
+        self.treatFreeAccountAsDeveloperSwitch.isOn = UserDefaults.standard.treatFreeAccountAsDeveloperAccount
         
         // BetaTestingRow
         self.betaUpdatesSwitch.isOn = UserDefaults.standard.isBetaUpdatesEnabled
@@ -894,7 +876,7 @@ private extension SettingsViewController
         }
     }
 
-    @objc func toggleTreatFreeAccountAsDeveloper(_ sender: UISwitch)
+    @IBAction func toggleTreatFreeAccountAsDeveloper(_ sender: UISwitch)
     {
         UserDefaults.standard.treatFreeAccountAsDeveloperAccount = sender.isOn
         UserDefaults.shared.treatFreeAccountAsDeveloperAccount = sender.isOn
@@ -1205,19 +1187,12 @@ extension SettingsViewController
         case .signIn: return (self.activeTeam == nil) ? 1 : 0
         case .account: return (self.activeTeam == nil) ? 0 : 3
         case .appRefresh: return AppRefreshRow.allCases.count
-        case .signing: return super.tableView(tableView, numberOfRowsInSection: section.rawValue) + 1
         default: return super.tableView(tableView, numberOfRowsInSection: section.rawValue)
         }
     }
     
     override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell
     {
-        let section = Section.allCases[indexPath.section]
-        if section == .signing, indexPath.row == ExtraSigningSettingsRow.treatFreeAsDeveloper
-        {
-            return self.makeTreatFreeAccountAsDeveloperCell()
-        }
-
         let cell = super.tableView(tableView, cellForRowAt: indexPath)
         
         if #available(iOS 14, *) {}
@@ -1248,17 +1223,6 @@ extension SettingsViewController
         
         
         return cell
-    }
-
-    override func tableView(_ tableView: UITableView, heightForRowAt indexPath: IndexPath) -> CGFloat
-    {
-        let section = Section.allCases[indexPath.section]
-        if section == .signing, indexPath.row == ExtraSigningSettingsRow.treatFreeAsDeveloper
-        {
-            return UITableView.automaticDimension
-        }
-
-        return super.tableView(tableView, heightForRowAt: indexPath)
     }
 
     override func tableView(_ tableView: UITableView, viewForHeaderInSection section: Int) -> UIView?
@@ -1596,18 +1560,6 @@ extension SettingsViewController
             case .refreshAttempts, .enableEMPForWiregaurd, .customizeAppId: break
             }
         case .signing:
-            if indexPath.row == ExtraSigningSettingsRow.treatFreeAsDeveloper
-            {
-                UserDefaults.standard.treatFreeAccountAsDeveloperAccount.toggle()
-                UserDefaults.shared.treatFreeAccountAsDeveloperAccount = UserDefaults.standard.treatFreeAccountAsDeveloperAccount
-                if UserDefaults.standard.treatFreeAccountAsDeveloperAccount
-                {
-                    UserDefaults.standard.activeAppsLimit = nil
-                }
-                tableView.reloadRows(at: [indexPath], with: .automatic)
-                return
-            }
-
             let row = SigningSettingsRow.allCases[indexPath.row]
             switch row {
             case .exportAccount: showExportAccount()
@@ -1763,6 +1715,10 @@ extension SettingsViewController
                 }
             case .exportSigningAssets:
                 self.exportSigningAssets()
+            case .treatFreeAsDeveloper:
+                self.treatFreeAccountAsDeveloperSwitch.setOn(!self.treatFreeAccountAsDeveloperSwitch.isOn, animated: true)
+                self.toggleTreatFreeAccountAsDeveloper(self.treatFreeAccountAsDeveloperSwitch)
+                tableView.deselectRow(at: indexPath, animated: true)
             }
         
         case .diagnostics:
