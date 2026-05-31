@@ -1261,17 +1261,6 @@ extension SettingsViewController
         return super.tableView(tableView, heightForRowAt: indexPath)
     }
 
-    override func tableView(_ tableView: UITableView, estimatedHeightForRowAt indexPath: IndexPath) -> CGFloat
-    {
-        let section = Section.allCases[indexPath.section]
-        if section == .signing, indexPath.row == ExtraSigningSettingsRow.treatFreeAsDeveloper
-        {
-            return 44
-        }
-
-        return super.tableView(tableView, estimatedHeightForRowAt: indexPath)
-    }
-    
     override func tableView(_ tableView: UITableView, viewForHeaderInSection section: Int) -> UIView?
     {
         let section = Section.allCases[section]
