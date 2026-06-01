@@ -81,7 +81,7 @@ class FetchProvisioningProfilesOperation: ResultOperation<[String: ALTProvisioni
                     {
                         dispatchGroup.enter()
                         
-                        self.prepareProvisioningProfile(for: appExtension, parentApp: app, team: team, session: session) { (result) in
+                        self.prepareProvisioningProfile(for: appExtension, parentApp: app, resolvedParentBundleIdentifier: profile.bundleIdentifier, team: team, session: session) { (result) in
                             switch result
                             {
                             case .failure(let e): error = e
@@ -189,6 +189,7 @@ extension FetchProvisioningProfilesOperation
     
     private func prepareProvisioningProfile(for app: ALTApplication,
                                     parentApp: ALTApplication?,
+                                    resolvedParentBundleIdentifier: String? = nil,
                                     team: ALTTeam,
                                     session: ALTAppleAPISession,
                                     completionHandler: @escaping (Result<ALTProvisioningProfile, Error>) -> Void)
@@ -252,24 +253,11 @@ extension FetchProvisioningProfilesOperation
                 // Or, if the app _is_ installed but with a different team, we need to create a new
                 // bundle identifier anyway to prevent collisions with the previous team.
                 let parentBundleID = parentApp?.bundleIdentifier ?? app.bundleIdentifier
-                let effectiveParentBundleID = self.context.bundleIdentifier
+                let updatedParentBundleID = resolvedParentBundleIdentifier ?? (self.context.bundleIdentifier + "." + team.identifier)
 
-                let updatedParentBundleID: String
-
-                if app.isAltStoreApp
+                if parentApp != nil
                 {
-                    // Use legacy bundle ID format for AltStore (and its extensions).
-                    updatedParentBundleID = effectiveParentBundleID + "." + team.identifier // Append just team identifier to make it harder to track.
-                }
-                else
-                {
-                    updatedParentBundleID = effectiveParentBundleID + "." + team.identifier // Append just team identifier to make it harder to track.
-                }
-
-                if let parentApp = parentApp,
-                   app.bundleIdentifier.hasPrefix(parentBundleID + ".")
-                {
-                    let suffix = String(app.bundleIdentifier.dropFirst(parentBundleID.count))
+                    let suffix = self.bundleIdentifierSuffix(for: app.bundleIdentifier, parentBundleIdentifier: parentBundleID, team: team) ?? "." + app.bundleIdentifier.components(separatedBy: ".").last!
                     bundleID = updatedParentBundleID + suffix
                 }
                 else
@@ -303,6 +291,28 @@ extension FetchProvisioningProfilesOperation
                 }
             }
         }
+    }
+
+    private func bundleIdentifierSuffix(for bundleIdentifier: String, parentBundleIdentifier: String, team: ALTTeam) -> String?
+    {
+        let parentCandidates = [
+            parentBundleIdentifier,
+            self.context.bundleIdentifier,
+            self.context.bundleIdentifier + "." + team.identifier,
+            Bundle.Info.appbundleIdentifier,
+            Bundle.Info.appbundleIdentifier + "." + team.identifier,
+        ]
+
+        for parentCandidate in Set(parentCandidates).sorted(by: { $0.count > $1.count })
+        {
+            let prefix = parentCandidate + "."
+            if bundleIdentifier.hasPrefix(prefix)
+            {
+                return String(bundleIdentifier.dropFirst(parentCandidate.count))
+            }
+        }
+
+        return nil
     }
     
     private func registerAppID(for application: ALTApplication,

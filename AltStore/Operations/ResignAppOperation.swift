@@ -120,10 +120,10 @@ private extension ResignAppOperation
         let openURL = InstalledApp.openAppURL(for: app)
         let fileURL = app.fileURL
 
-        func prepare(_ bundle: Bundle, bundleID identifier: String?, additionalInfoDictionaryValues: [String: Any] = [:]) throws
+        func prepare(_ bundle: Bundle, bundleID identifier: String?, provisioningProfile explicitProfile: ALTProvisioningProfile? = nil, additionalInfoDictionaryValues: [String: Any] = [:]) throws
         {
             guard let identifier else { throw ALTError(.missingAppBundle) }
-            guard let profile = context.useMainProfile ? profiles.values.first : profiles[identifier] else { throw ALTError(.missingProvisioningProfile) }
+            guard let profile = explicitProfile ?? (context.useMainProfile ? profiles.values.first : profiles[identifier]) else { throw ALTError(.missingProvisioningProfile) }
             guard var infoDictionary = bundle.completeInfoDictionary else { throw ALTError(.missingInfoPlist) }
             
             if let forcedBundleIdentifier = appexBundleIds[identifier] {
@@ -264,7 +264,8 @@ private extension ResignAppOperation
                         
                         guard let appExtension = Bundle(url: fileURL) else { throw ALTError(.missingAppBundle) }
                         let updatedAppExBundleId = appExtension.bundleIdentifier?.replacingOccurrences(of: app.bundleIdentifier, with: bundleIdentifier)
-                        try prepare(appExtension, bundleID: updatedAppExBundleId)
+                        let profile = self.provisioningProfile(forAppExtensionBundleIdentifier: appExtension.bundleIdentifier, updatedBundleIdentifier: updatedAppExBundleId, profiles: profiles)
+                        try prepare(appExtension, bundleID: updatedAppExBundleId ?? appExtension.bundleIdentifier, provisioningProfile: profile)
                     }
                 }
                 
@@ -277,6 +278,21 @@ private extension ResignAppOperation
         }
         
         return progress
+    }
+
+    func provisioningProfile(forAppExtensionBundleIdentifier bundleIdentifier: String?,
+                             updatedBundleIdentifier: String?,
+                             profiles: [String: ALTProvisioningProfile]) -> ALTProvisioningProfile?
+    {
+        for identifier in [updatedBundleIdentifier, bundleIdentifier].compactMap({ $0 })
+        {
+            if let profile = profiles[identifier]
+            {
+                return profile
+            }
+        }
+
+        return nil
     }
     
     func resignAppBundle(at fileURL: URL, team: ALTTeam, certificate: ALTCertificate, profiles: [ALTProvisioningProfile], completionHandler: @escaping (Result<URL, Error>) -> Void) -> Progress
