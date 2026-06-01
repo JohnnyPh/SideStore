@@ -119,6 +119,8 @@ private extension ResignAppOperation
         let bundleIdentifier = context.bundleIdentifier
         let openURL = InstalledApp.openAppURL(for: app)
         let fileURL = app.fileURL
+        let signedParentBundleIdentifier = profiles[bundleIdentifier]?.bundleIdentifier ?? profiles.values.first?.bundleIdentifier ?? bundleIdentifier
+        var resolvedAppExtensionBundleIds = appexBundleIds
 
         func prepare(_ bundle: Bundle, bundleID identifier: String?, provisioningProfile explicitProfile: ALTProvisioningProfile? = nil, additionalInfoDictionaryValues: [String: Any] = [:]) throws
         {
@@ -126,7 +128,7 @@ private extension ResignAppOperation
             guard let profile = explicitProfile ?? (context.useMainProfile ? profiles.values.first : profiles[identifier]) else { throw ALTError(.missingProvisioningProfile) }
             guard var infoDictionary = bundle.completeInfoDictionary else { throw ALTError(.missingInfoPlist) }
             
-            if let forcedBundleIdentifier = appexBundleIds[identifier] {
+            if let forcedBundleIdentifier = resolvedAppExtensionBundleIds[identifier] {
                 infoDictionary[kCFBundleIdentifierKey as String] = forcedBundleIdentifier
             } else {
                 infoDictionary[kCFBundleIdentifierKey as String] = profile.bundleIdentifier
@@ -263,9 +265,16 @@ private extension ResignAppOperation
                         #endif
                         
                         guard let appExtension = Bundle(url: fileURL) else { throw ALTError(.missingAppBundle) }
-                        let updatedAppExBundleId = appExtension.bundleIdentifier?.replacingOccurrences(of: app.bundleIdentifier, with: bundleIdentifier)
+                        let updatedAppExBundleId = self.updatedAppExtensionBundleIdentifier(appExtension.bundleIdentifier,
+                                                                                             parentBundleIdentifier: app.bundleIdentifier,
+                                                                                             signedParentBundleIdentifier: signedParentBundleIdentifier)
+                        if let bundleIdentifier = appExtension.bundleIdentifier, let updatedAppExBundleId
+                        {
+                            resolvedAppExtensionBundleIds[bundleIdentifier] = updatedAppExBundleId
+                        }
+
                         let profile = self.provisioningProfile(forAppExtensionBundleIdentifier: appExtension.bundleIdentifier, updatedBundleIdentifier: updatedAppExBundleId, profiles: profiles)
-                        try prepare(appExtension, bundleID: updatedAppExBundleId ?? appExtension.bundleIdentifier, provisioningProfile: profile)
+                        try prepare(appExtension, bundleID: appExtension.bundleIdentifier, provisioningProfile: profile)
                     }
                 }
                 
@@ -278,6 +287,35 @@ private extension ResignAppOperation
         }
         
         return progress
+    }
+
+    func updatedAppExtensionBundleIdentifier(_ bundleIdentifier: String?,
+                                             parentBundleIdentifier: String,
+                                             signedParentBundleIdentifier: String) -> String?
+    {
+        guard let bundleIdentifier else { return nil }
+
+        let parentCandidates = [
+            parentBundleIdentifier,
+            self.context.bundleIdentifier,
+            Bundle.Info.appbundleIdentifier,
+        ]
+
+        for parentCandidate in Set(parentCandidates).sorted(by: { $0.count > $1.count })
+        {
+            let prefix = parentCandidate + "."
+            if bundleIdentifier.hasPrefix(prefix)
+            {
+                return signedParentBundleIdentifier + String(bundleIdentifier.dropFirst(parentCandidate.count))
+            }
+        }
+
+        if bundleIdentifier.hasPrefix(signedParentBundleIdentifier + ".")
+        {
+            return bundleIdentifier
+        }
+
+        return signedParentBundleIdentifier + "." + bundleIdentifier.components(separatedBy: ".").last!
     }
 
     func provisioningProfile(forAppExtensionBundleIdentifier bundleIdentifier: String?,
